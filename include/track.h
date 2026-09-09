@@ -40,6 +40,7 @@ typedef struct
     bool  sawR[TRK_ROWS];
     bool  valid[TRK_ROWS];
 
+    uint8_t segCount;  /* usable vectors this frame, after filtering      */
     uint8_t nValid;    /* rows 0..nValid-1 are usable and contiguous      */
     uint8_t topRow;    /* highest usable row index                        */
     bool    haveTrack; /* enough of a corridor to drive on                */

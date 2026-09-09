@@ -46,7 +46,7 @@ void RL_Compute(const TrackModel *m, float speedFrac, RacingLine *out)
 {
     uint8_t la;
     float   hn, hf, a, b, turn;
-    float   bias, target, half, usable;
+    float   bias, target, half, usable, conf;
     float   lo, hi, yNear, span;
     uint8_t j;
 
@@ -64,12 +64,37 @@ void RL_Compute(const TrackModel *m, float speedFrac, RacingLine *out)
         return;
     }
 
+    /*
+     * How well did the camera describe the curve? One vector per edge is a chord:
+     * accurate at its two ends, but sagging to the inside of the bend everywhere in
+     * between, and carrying no curvature at all. Several short vectors describe the
+     * same curve properly.
+     */
+    if (m->segCount >= (uint8_t)LINE_CONF_SEGS_FULL)
+    {
+        conf = 1.0f;
+    }
+    else
+    {
+        float t = (float)m->segCount / (float)LINE_CONF_SEGS_FULL;
+
+        conf = LINE_CONF_MIN + ((1.0f - LINE_CONF_MIN) * clampf(t, 0.0f, 1.0f));
+    }
+
     /* ---------------------------------------------------------------
      * 1. How far ahead to aim.
+     *
+     * Normally this is set by speed alone. But when the curve has been chorded, the
+     * only two points guaranteed to be on the real line are the ends of that chord -
+     * so the aim point is pushed outward, onto the far end, where the error goes back
+     * to zero. Aiming at a middle row would aim at the sag, which is inside the
+     * corner, and the car would turn in early.
      * -------------------------------------------------------------*/
     {
         float f = clampf(speedFrac, 0.0f, 1.0f);
         float r = (float)LINE_LA_ROW_MIN + (f * (float)(LINE_LA_ROW_MAX - LINE_LA_ROW_MIN));
+
+        r += (1.0f - conf) * LINE_LA_LOWCONF_BOOST;
 
         la = (uint8_t)(r + 0.5f);
         if (la > m->topRow)
@@ -119,6 +144,11 @@ void RL_Compute(const TrackModel *m, float speedFrac, RacingLine *out)
         out->chicane = true;
         bias         = 0.0f;
     }
+
+    /* The chord already leans toward the inside of the bend; diving for an apex on
+     * top of that is how the car ends up cutting the corner. So the racing line is
+     * scaled back by the same confidence. */
+    bias *= conf;
 
     s_bias += LINE_BIAS_ALPHA * (bias - s_bias);
     s_bias = clampf(s_bias, -1.0f, 1.0f);

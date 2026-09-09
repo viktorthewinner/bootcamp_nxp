@@ -45,6 +45,10 @@ static int    g_cn = 0;
 static double g_dumpFrom = -1.0, g_dumpTo = -1.0;
 static double g_step = 0.5; /* cm between centre line samples */
 static double g_halfW = 22.5;
+/* How many vectors the Pixy2 splits one track edge into. Real hardware
+ * merges smooth curves into a single long straight vector, which chords
+ * across the arc - set this to 1 to reproduce that. */
+static int g_maxChunks = 3;
 
 static void build_centerline(const TrackSeg *segs, int n)
 {
@@ -153,6 +157,7 @@ static int render_edge(const Cam *cam, double px, double py, double pth, int hin
     /* Split the point chain into up to 3 straight vectors. */
     {
         int chunks = (np >= 12) ? 3 : ((np >= 6) ? 2 : 1);
+        if (chunks > g_maxChunks) chunks = g_maxChunks;
         int c;
         for (c = 0; c < chunks && nseg < maxOut; c++)
         {
@@ -573,6 +578,7 @@ int main(int argc, char **argv)
         double half = 22.5;
 
         cm.f = 68.0; cm.h = 18.0; cm.horiz = -4.0;
+        if (argc > 2) g_maxChunks = atoi(argv[2]);
         for (i = 0; i < PROF_N; i++) { g_profSum[i] = 0.0; g_profCnt[i] = 0.0; g_profBias[i]=0.0; g_profWE[i]=0.0; g_profHF[i]=0.0; }
         g_profLo = (int)(180.0 / g_step);
         g_profHi = (int)((260.0 + (85.0 * M_PI) + 120.0) / g_step);
@@ -613,6 +619,41 @@ int main(int argc, char **argv)
         printf("\n%48s\n", "outside      centre      inside");
         printf("excursions=%d  minClearance=%+.2f cm  laptime=%.2fs\n",
                r.excursions, r.minClear, r.lapTime);
+        return 0;
+    }
+
+    if (argc > 1 && strcmp(argv[1], "-chord") == 0)
+    {
+        /* The same corners seen two ways: with the camera splitting each edge into
+         * up to three vectors, and with it merging each edge into one long straight
+         * vector that chords across the curve - which is what the real Pixy2 does to
+         * a smooth corner. */
+        int c;
+
+        printf("=== effect of the Pixy2 merging a curve into one straight vector ===\n");
+        printf("%-22s %-9s %-10s %-9s %s\n", "vectors per edge", "finished", "total lap",
+               "minClear", "excursions");
+        for (c = 3; c >= 1; c--)
+        {
+            TrackSeg t[] = {
+                {0.0, 250.0},
+                {1.0 / 70.0, 70.0 * M_PI},
+                {0.0, 200.0},
+                {-1.0 / 90.0, 90.0 * (M_PI / 2)},
+                {0.0, 150.0},
+            };
+            Cam cm;
+            Result r;
+            double total;
+
+            cm.f = 68.0; cm.h = 18.0; cm.horiz = -4.0;
+            g_maxChunks = c;
+            r = run(t, 5, &cm, 22.5, 0.0, "chord", 0, 40.0);
+            total = r.lapTime;
+            printf("%-22d %-9s %-10.2f %+8.2f  %d\n", c, r.finished ? "yes" : "NO",
+                   total, r.minClear, r.excursions);
+        }
+        g_maxChunks = 3;
         return 0;
     }
 

@@ -64,6 +64,30 @@ Your current settings, and what I would change:
 Then **save the settings to the Pixy** (not just to PixyMon) and make sure the Pixy2 is
 running the **line tracking** program, so it boots into it with no PC attached.
 
+### 1b. Stop the camera merging curves — this is the "turns in too early" fix
+
+Point the camera at a smooth corner and look at the arrows PixyMon draws. If a curve
+comes back as **one long straight arrow**, the tracker has fitted a single line across
+the whole arc. That single fact causes the car to turn in early, and no amount of gain
+tuning fixes it:
+
+- a straight line drawn across an arc touches the real line only at its two ends, and
+  sits **inside** the bend everywhere in between
+- both track edges sag inward together, so the corridor centre sags inward too
+- worse, `headNear` and `headFar` come out equal, so `curv` is zero — the car reads a
+  corner as *a straight road at an angle*, and steers to line up with it immediately.
+  The corner effectively gets smeared backwards into the straight before it
+
+In PixyMon's **Expert** tab, lower the line merging distance and the minimum line length
+until a smooth corner shows **two or three separate arrows instead of one**. That is the
+whole fix, and it is worth more than any tuning below.
+
+The firmware copes either way — it detects the low vector count and both aims at the far
+end of the chord (where the error returns to zero) and scales back the racing line, which
+keeps the car off the lines. But it cannot invent curvature the camera threw away, so the
+line stays compromised until the camera is fixed. `tools/capture.ps1` reports this
+directly: it counts vectors per frame in corners and tells you if they are being merged.
+
 ### 2. Camera aim — this one matters more than any gain
 
 The most useful thing that came out of testing: across 162 simulated camera mountings,
@@ -90,18 +114,22 @@ place the car, then the speed ramps in. If a wheel spins the wrong way, set
 
 ## Tuning, in the order that works
 
-1. **`SPEED_MAX`** (default 65). The headline number. Raise it 5 at a time until the car
-   looks nervous, then back off 5. Worth knowing: in simulation, raising `SPEED_MAX` from
-   45 to 110 changed total lap time by only 14%, because corner speed is set by what the
-   camera can see, not by this number. It is a straight-line ceiling, not a lap-time dial.
-2. **`STEER_KP` / `STEER_KH`**. Wobbling on straights → lower them. Turning in late and
+1. **`SPEED_MIN`** (default 44) is the corner floor, and on this car it matters more than
+   `SPEED_MAX`. It was originally 32, which turned out to be *counterproductive*: at low
+   corner speed the look-ahead row pulls in close, the line gets twitchy, and the car was
+   both slower and closer to the lines. Raising it to 44 cut a fifth off every lap and
+   increased clearance at the same time.
+2. **`SPEED_MAX`** (default 75). The straight-line ceiling. Raise it 5 at a time until the
+   car looks nervous, then back off 5. It is not a lap-time dial - corner speed is set by
+   what the camera can see, not by this number.
+3. **`STEER_KP` / `STEER_KH`**. Wobbling on straights → lower them. Turning in late and
    touching the outside line → raise them.
-3. **`LINE_APEX_BIAS`** (0.85). How hard it dives for the apex. Lower it if the car kisses
+4. **`LINE_APEX_BIAS`** (0.85). How hard it dives for the apex. Lower it if the car kisses
    the inside line.
-4. **`SAFE_MARGIN_FRAC`** (0.22). The safety belt — the keep-out band beside each line as a
+5. **`SAFE_MARGIN_FRAC`** (0.22). The safety belt — the keep-out band beside each line as a
    fraction of track width. Raising it makes the car drive more centrally and more safely.
-5. **`CHICANE_DEADBAND_BIG`** / **`CORNER_HEAD_IGNORE`**. How much wiggle gets ignored.
-6. **`STEER_LIMIT_RIGHT`** (45) is carried over from the original config and is noticeably
+6. **`CHICANE_DEADBAND_BIG`** / **`CORNER_HEAD_IGNORE`**. How much wiggle gets ignored.
+7. **`STEER_LIMIT_RIGHT`** (45) is carried over from the original config and is noticeably
    tighter than `STEER_LIMIT_LEFT` (-60). If the car understeers in right-handers but not
    left-handers, this is why — raise it toward 60 if the linkage allows.
 
@@ -160,8 +188,10 @@ image, the car lifts and brakes **before** the corner rather than in the middle 
 - capped when only one edge is visible, because the other one is a guess
 - ramped on acceleration, dropped instantly on deceleration, with a short reverse pulse
   from the H-bridge when a lot of speed has to go quickly
-- the inside wheel is slowed through a corner, which rotates the car into the turn instead
-  of pushing it wide
+- the two wheels are split **around** the commanded speed through a corner - outside up,
+  inside down by the same amount - which rotates the car into the turn without costing
+  any drive. Slowing only the inside wheel, the obvious way to do this, quietly throws
+  away up to a fifth of the thrust at full lock, exactly where the car needs it most
 
 **Ignoring the small stuff.** The steering deadband is not fixed — it slides from wide to
 narrow depending on how corner-like the road is. Crucially, corner-ness is judged from
@@ -203,6 +233,46 @@ throttle through a corner.
 
 ---
 
+## Getting data off the car
+
+There was no way to see what the car was doing, and both obvious routes are dead ends
+on this board. The debug console is semihosted, so it needs a debugger attached and
+stalls the control loop for milliseconds per line. The debug UART is worse: `board.h`
+puts it on LPUART4, but **LPUART4 is not in this project's pin mux** — only CTIMER0,
+CTIMER2, GPIO0, LP_FLEXCOMM0 and LP_FLEXCOMM2 are routed. That is why the MCU-Link
+VCOM port is silent no matter what you print.
+
+So instead there is a flight recorder. One 32-byte record per camera frame goes into a
+ring buffer in SRAMX — a 96 KB block this project otherwise never touches — and the
+whole thing is read out afterwards through the SWD probe. It costs a few dozen
+nanoseconds per frame, needs no cable while the car drives, and the buffer is in the
+linker's no-init section so the log survives a reset.
+
+```powershell
+.\tools\capture.ps1                  # capture and print the audit
+.\tools\capture.ps1 -Csv run1.csv    # also dump every frame to CSV
+```
+
+**Stop the debugger in VS Code first** — only one thing can own the probe at a time,
+and a debug session left running is the usual reason capture fails. The script checks
+and tells you.
+
+The decoder does not just dump numbers; it reports the things that cannot be known
+from the code or from simulation because they depend on your camera and your track:
+the real frame rate, how often each line was visible, the corridor width the car
+actually measured, whether the corridor sits centred in the frame, and whether the
+heading values land in the range the corner thresholds assume. Then it says what it
+thinks is wrong.
+
+### Bench mode
+
+`RACE_BENCH_MODE` in `race_config.h` runs everything — camera, track model, racing
+line, servo — with the drive motors held at zero. Use it for the first capture, with
+the car in your hand over the track. The steering will move, so you can see the
+firmware reacting, but nothing drives off the bench. Set it back to `0` to race.
+
+---
+
 ## Testing
 
 The control code is compiled and raced on the PC before it goes near the car:
@@ -222,20 +292,23 @@ Results with the shipped defaults:
 
 | Circuit | Lap | Closest approach to a line |
 |---|---|---|
-| Oval, 90 cm radius | 9.35 s | +2.44 cm |
-| Tight 180s, 55 / 80 cm | 7.91 s | +2.19 cm |
-| Chicane + sweepers | 10.36 s | +7.15 cm |
-| Mixed circuit, started off-centre | 7.82 s | +3.50 cm |
-| Narrow 35 cm track | 8.00 s | +0.17 cm |
+| Oval, 90 cm radius | 7.22 s | +4.96 cm |
+| Tight 180s, 55 / 80 cm | 5.92 s | +4.95 cm |
+| Chicane + sweepers | 8.10 s | +7.23 cm |
+| Mixed circuit, started off-centre | 6.02 s | +3.50 cm |
+| Narrow 35 cm track | 6.54 s | +0.03 cm |
+
+The 35 cm track is deliberately narrower than any real NXP Cup lane (45-60 cm) — the car
+is 14 cm wide, so it fills 40% of it. Every realistic circuit clears by 3.5 cm or more.
 
 **Chicanes** — the little ones are ignored, and at full speed:
 
 | Feature | Peak steer | Speed through it | Result |
 |---|---|---|---|
-| Tiny wiggle (~8 cm) | 8.8 | 229 cm/s (straight-line speed) | **ignored, drove straight through** |
-| Small chicane | 23.7 | 176 cm/s | mild correction |
-| Medium chicane | 45.0 | 121 cm/s | steered |
-| Real S bend | 60.0 | 87 cm/s | steered and braked |
+| Tiny wiggle (~8 cm) | 9.5 | 267 cm/s (straight-line speed) | **ignored, drove straight through** |
+| Small chicane | 26.1 | 220 cm/s | mild correction |
+| Medium chicane | 52.6 | 114 cm/s | steered |
+| Real S bend | 60.0 | 118 cm/s | steered and braked |
 
 **Camera failure** — **no line contact in any of these**:
 

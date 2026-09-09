@@ -289,7 +289,7 @@ static void plan_speed(void)
 void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, DriveCmd *cmd)
 {
     float v;
-    float base, diff, inner, outL, outR, m1, m2;
+    float base, diff, inner, outer, outL, outR, m1, m2;
     bool  running;
 
     dt = clampf(dt, 1.0e-4f, 0.2f);
@@ -471,23 +471,40 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
     }
     else
     {
-        /* Torque vectoring: the inside wheel is slowed through a corner, which turns
-         * the car on its own axis and takes the load off the front tyres. */
-        diff = DIFF_GAIN * (fabsf(s_steer) / 100.0f);
-        diff = clampf(diff, 0.0f, 0.9f);
+        /* Torque vectoring: the wheels are split around the commanded speed rather
+         * than by dragging the inside one down. Same difference between the wheels,
+         * so the same yaw moment turning the car into the corner - but the average
+         * of the two stays at what the speed planner actually asked for.
+         *
+         * Slowing only the inside wheel, which is the obvious way to do this, quietly
+         * throws away up to a fifth of the drive at full lock. That is precisely the
+         * moment the car most needs it. */
+        diff = 0.5f * DIFF_GAIN * (fabsf(s_steer) / 100.0f);
+        diff = clampf(diff, 0.0f, 0.45f);
     }
 
+    outer = base * (1.0f + diff);
     inner = base * (1.0f - diff);
+
+    /* If the outer wheel runs out of range, take the excess off both rather than
+     * scaling them together - that keeps the yaw moment instead of shrinking it. */
+    if (outer > 100.0f)
+    {
+        float over = outer - 100.0f;
+
+        outer = 100.0f;
+        inner -= over;
+    }
 
     if (s_steer >= 0.0f) /* turning right, so the right wheel is on the inside */
     {
-        outL = base;
+        outL = outer;
         outR = inner;
     }
     else
     {
         outL = inner;
-        outR = base;
+        outR = outer;
     }
 
     m1 = outL;
@@ -511,4 +528,11 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
     cmd->left  = clampf(m1, -100.0f, 100.0f);
     cmd->right = clampf(m2, -100.0f, 100.0f);
     cmd->speed = s_speedCmd;
+
+#if RACE_BENCH_MODE
+    /* Bench mode: steering still moves so it can be watched, wheels stay dead. */
+    cmd->left    = 0.0f;
+    cmd->right   = 0.0f;
+    cmd->braking = false;
+#endif
 }

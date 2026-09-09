@@ -479,6 +479,7 @@ bool Track_Update(const TrkSegment *segs, uint8_t n, TrackModel *out)
         }
     }
 
+    out->segCount  = nv;
     out->nValid    = 0u;
     out->topRow    = 0u;
     out->bothEdges = false;

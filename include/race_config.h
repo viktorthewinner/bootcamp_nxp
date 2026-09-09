@@ -18,8 +18,26 @@
  * DEBUG
  * ===================================================================*/
 /* Keep this 0 when the car drives on its own. The debug console is semihosted:
- * with no debugger attached every PRINTF stalls the control loop. */
+ * with no debugger attached every PRINTF stalls the control loop. Use the flight
+ * recorder below instead - it costs nothing and works while the car is untethered. */
 #define RACE_DEBUG                 0
+
+/* Flight recorder. One 32 byte record per camera frame into a ring buffer in SRAMX,
+ * read out afterwards over the debug probe with tools/capture.ps1. Roughly 50 seconds
+ * of history. Leave it on: it is a few dozen nanoseconds per frame and it is the only
+ * way to find out what the car actually did. */
+#define RACE_TELEMETRY             1
+
+/* Bench mode: everything runs - camera, track model, racing line, servo - but the
+ * drive motors are held at zero. Use it for the first capture, with the car in your
+ * hand over the track, to check what the camera and the track model are really doing
+ * before anything moves. Set back to 0 to race.
+ *
+ * The host simulator forces this to 0 on its own command line - a bench-mode car
+ * never moves, so leaving it on would quietly turn every test green. */
+#ifndef RACE_BENCH_MODE
+#define RACE_BENCH_MODE            0
+#endif
 
 /* =====================================================================
  * CAMERA - Pixy2 line-tracking grid
@@ -165,7 +183,9 @@
  * RACING LINE - outside, inside, outside
  * Bias is a fraction of the usable half-corridor. + = toward the right edge.
  * ===================================================================*/
-#define LINE_APEX_BIAS             0.85f   /* dive to the inside at the apex     */
+#ifndef LINE_APEX_BIAS
+#define LINE_APEX_BIAS             0.85f
+#endif   /* dive to the inside at the apex     */
 #define LINE_ENTRY_BIAS            0.75f   /* hold the outside on the way in     */
 #define LINE_EXIT_BIAS             0.45f   /* let it run wide on the way out     */
 #define LINE_BIAS_ALPHA            0.25f   /* smoothing, per new camera frame    */
@@ -182,9 +202,44 @@
  * while the apex weight still waits for the real thing. */
 #define LINE_ENTRY_HEAD_REF        0.60f
 
-/* Aim point. Slow = look close and be precise, fast = look far and be smooth. */
+/* Aim point. Slow = look close and be precise, fast = look far and be smooth.
+ *
+ * LA_ROW_MAX is 7, the farthest row, on purpose. The Pixy2 merges a smooth curve into
+ * one long straight vector, and a straight line drawn across an arc touches the real
+ * line only at its two ends - in between it sits on the inside of the curve. Aiming at
+ * a middle row therefore aims inside the corner, and the car turns in early. The far
+ * row lands on the far end of that vector, where the error goes back to zero. */
+#ifndef LINE_LA_ROW_MIN
 #define LINE_LA_ROW_MIN            3
+#endif
+#ifndef LINE_LA_ROW_MAX
 #define LINE_LA_ROW_MAX            6
+#endif
+
+/*
+ * How much the racing line is trusted when the camera has not given enough pieces to
+ * measure curvature at all.
+ *
+ * A single vector per edge is a chord. It says which way the track is going on average
+ * but nothing about how it bends, so headNear and headFar come out equal and the car
+ * reads a hard corner as a straight road at an angle. Worse, the chord sits on the
+ * inside of the bend, and the apex bias also pulls to the inside - the two errors
+ * compound and the car cuts the corner.
+ *
+ * So when the vector count is low the bias is scaled back toward the centre line. With
+ * three or more vectors the curve is properly described and the full racing line is
+ * used. This is the belt; the braces are the PixyMon "Maximum merge distance" setting,
+ * which is what stops the camera merging curves in the first place. */
+#define LINE_CONF_SEGS_FULL        4    /* this many vectors = full confidence */
+#ifndef LINE_CONF_MIN
+#define LINE_CONF_MIN              0.45f
+
+/* Extra look-ahead rows used when the curve has been chorded, to put the aim point
+ * on the far end of the chord where it touches the real line again. */
+#ifndef LINE_LA_LOWCONF_BOOST
+#define LINE_LA_LOWCONF_BOOST      2.0f
+#endif
+#endif
 
 /* =====================================================================
  * CHICANES - ignore the small ones
@@ -271,11 +326,13 @@
  * ===================================================================*/
 /* THE headline number. Start at 65, raise it 5 at a time. */
 #ifndef SPEED_MAX
-#define SPEED_MAX                  65.0f
+#define SPEED_MAX                  75.0f
 #endif
 
 /* Slowest the car is allowed to go while it can still see the track. */
-#define SPEED_MIN                  32.0f
+#ifndef SPEED_MIN
+#define SPEED_MIN                  44.0f
+#endif
 
 /* Global scale, handy for a quick trackside calm-down. 1.0 = full. */
 #define SPEED_SCALE                1.00f
@@ -293,10 +350,14 @@
  * track model is still valid. */
 #define SPEED_SEE_ROWS_FULL        6       /* this many valid rows = no penalty */
 #define SPEED_SEE_ROWS_MIN         2       /* at or below this = crawl          */
+#ifndef SPEED_SEE_FLOOR
 #define SPEED_SEE_FLOOR            0.45f
+#endif
 
 /* Cap while only one edge of the track is visible. */
-#define SPEED_ONE_EDGE_CAP         0.82f
+#ifndef SPEED_ONE_EDGE_CAP
+#define SPEED_ONE_EDGE_CAP         0.92f
+#endif
 
 /* Acceleration is ramped, braking is instant - same as a real car. Units per second. */
 #define SPEED_ACCEL_PER_S          140.0f
@@ -313,7 +374,9 @@
 /* =====================================================================
  * TORQUE VECTORING - slow the inside wheel through a corner
  * ===================================================================*/
-#define DIFF_GAIN                  0.45f   /* 0 = off, 0.45 = inner wheel at 55% at full lock */
+#ifndef DIFF_GAIN
+#define DIFF_GAIN                  0.55f
+#endif   /* 0 = off, 0.45 = inner wheel at 55% at full lock */
 
 /* =====================================================================
  * MOTORS

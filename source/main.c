@@ -28,6 +28,9 @@
 #include "driver.h"
 #include "hbridge.h"
 #include "servo.h"
+#if RACE_TELEMETRY
+#include "telemetry.h"
+#endif
 
 static PixyVector s_vectors[PIXY_MAX_VECTORS];
 static TrkSegment s_segments[PIXY_MAX_VECTORS];
@@ -76,6 +79,9 @@ int main(void)
     pixy_t   cam;
     DriveCmd cmd;
     uint32_t tPrev;
+#if RACE_TELEMETRY
+    uint32_t tFrame;
+#endif
 
     BOARD_InitHardware();
     BOARD_InitBootPins();
@@ -104,8 +110,14 @@ int main(void)
     (void)pixy_set_led(&cam, 0u, 40u, 0u);
 
     Driver_Init();
+#if RACE_TELEMETRY
+    Telemetry_Init();
+#endif
 
     tPrev = Ticks_Us();
+#if RACE_TELEMETRY
+    tFrame = tPrev;
+#endif
 
     for (;;)
     {
@@ -128,6 +140,17 @@ int main(void)
 
         Steer(cmd.steer + STEER_OFFSET);
         HbridgeSpeedF(&g_hbridge, cmd.left, cmd.right);
+
+#if RACE_TELEMETRY
+        /* One record per camera frame, not per loop: the loop runs several times
+         * faster than the Pixy2 and the extra records would say nothing new. */
+        if (fresh)
+        {
+            Telemetry_Log(Driver_State(), &cmd, n, now - tFrame, now / 1000u,
+                          cam.errors, cam.timeouts);
+            tFrame = now;
+        }
+#endif
 
 #if RACE_DEBUG
         debug_report(&cmd);

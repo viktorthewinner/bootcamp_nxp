@@ -20,7 +20,7 @@ $CC -O1 -std=gnu99 -o "$OUT" \
     "$HERE/../source/track.c" \
     "$HERE/../source/racing_line.c" \
     "$HERE/../source/driver.c" \
-    -I"$HERE/../include" -lm
+    -I"$HERE/../include" -DRACE_BENCH_MODE=0 -lm
 if [ $# -eq 0 ]; then
     "$OUT"; echo; "$OUT" -line; echo; "$OUT" -chicane; echo; "$OUT" -fault; echo; "$OUT" -sweep
 else
