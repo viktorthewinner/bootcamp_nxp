@@ -1,5 +1,6 @@
 #include "driver.h"
 #include "race_config.h"
+#include "speed_ctl.h"
 #include <math.h>
 
 static DriveState s_st;
@@ -13,6 +14,7 @@ static float s_speedCmd;  /* speed after the acceleration ramp        */
 static float s_speedFrac; /* 0..1, feeds the look ahead distance      */
 static float s_sinceFrame;
 static float s_blindMs;
+static float s_blindM;    /* metres travelled since the track was last seen */
 static float s_frameDt;     /* smoothed gap between camera frames, seconds */
 static float s_frameDtBest; /* the best this camera has managed - learned      */
 static float s_brakeMs;
@@ -91,6 +93,7 @@ void Driver_Init(void)
 
     Track_Init();
     RL_Init();
+    SpeedCtl_Init();
 
     s_steer      = 0.0f;
     s_steerTgt   = 0.0f;
@@ -101,6 +104,7 @@ void Driver_Init(void)
     s_speedFrac  = 0.0f;
     s_sinceFrame  = 0.0f;
     s_blindMs     = 0.0f;
+    s_blindM      = 0.0f;
     s_frameDt     = 0.020f;
     s_frameDtBest = 0.020f;
     s_brakeMs     = 0.0f;
@@ -177,7 +181,38 @@ static void plan_steering(float dtFrame)
         db = 0.0f;
     }
 
+#if STEER_PURE_PURSUIT
+    /*
+     * Geometric steering: the angle that actually puts the car on the aim point,
+     * rather than a fixed gain on the pixel error.
+     *
+     *     steer = K * Dx * w      K = 200*(L/W) / (f^2 * maxSteer)
+     *
+     * Dx is how far the aim point sits beside the car in pixels, and w is the
+     * corridor width in pixels at that row - which is the firmware's own
+     * calibration-free measure of how far away the row is. Multiplying by it is
+     * what turns a fixed gain into one that schedules itself with look-ahead.
+     */
+    {
+        float w = m->width[l->laRow];
+        float dx = l->targetX - CAM_CENTER_X;
+
+        /* A row the model is unsure about can carry a stale or silly width, and
+         * width multiplies the command directly. */
+        if (w < TRK_MIN_ROW_WIDTH_PX)
+        {
+            w = TRK_MIN_ROW_WIDTH_PX;
+        }
+        if (w > TRK_WIDTH_NEAR_PX)
+        {
+            w = TRK_WIDTH_NEAR_PX;
+        }
+
+        uPos = ((STEER_PP_SCALE * STEER_PP_K * dx * w) + (STEER_KH * headN)) / 100.0f;
+    }
+#else
     uPos = ((STEER_KP * errN) + (STEER_KH * headN)) / 100.0f;
+#endif
     uPos = soft_deadband(uPos, db);
 
     /* Damping runs on the filtered aim error. Feeding it from the post-deadband
@@ -189,6 +224,43 @@ static void plan_steering(float dtFrame)
     s_errFPrev = s_errF;
 
     steer = (uPos * 100.0f) + dTerm;
+
+    /*
+     * Curvature feedforward.
+     *
+     * A constant-radius corner needs a constant steering angle, L/R. Everything
+     * above is proportional to an error, and proportional terms can only hold a
+     * constant output by holding a constant error - so without this the car has
+     * to sit off the line for the whole corner just to keep the wheels turned.
+     * On a 90 cm corner that standing offset is wider than half the track, which
+     * is precisely why a P-only car cannot hold an apex.
+     *
+     * curv is headFar - headNear, which cancels the car's own lateral offset and
+     * leaves the bend itself, and it is proportional to real curvature. So hand
+     * the servo the angle the geometry needs and let the error terms go back to
+     * doing what they are for.
+     *
+     * Scaled by cornerness, which is exactly zero on a straight, and switched
+     * off in a recognised chicane: the car has already decided to drive that one
+     * straight through, and feeding forward into it would undo the decision.
+     */
+    if (!l->chicane)
+    {
+        /*
+         * curv is only a curvature while the road bends one way. In an S the two
+         * headings point opposite ways and their difference is large without any
+         * single radius existing at all - which is why plan_speed already throws
+         * curv away for a chicane. Feeding that number forward asks for most of
+         * full lock on a road that is close to straight.
+         *
+         * So the term is clamped to a curvature the track can really contain.
+         * STEER_KFF_CURV_MAX is 2.0, a half-metre radius, tighter than anything
+         * an NXP Cup layout puts down.
+         */
+        float c = clampf(m->curv, -STEER_KFF_CURV_MAX, STEER_KFF_CURV_MAX);
+
+        steer += STEER_KFF * c * cornerness_of(m);
+    }
 
     /* Left and right are not mechanically identical on this car. */
     steer *= (steer >= 0.0f) ? STEER_GAIN_RIGHT : STEER_GAIN_LEFT;
@@ -370,17 +442,55 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
      * the last known plan. After that the car slows, and if it really cannot find the
      * track it stops. Stopping loses a race; ploughing across the grass at full speed
      * loses the car. */
+    /*
+     * How far the car has travelled since it last saw the track.
+     *
+     * Distance, not a count of frames. What limits how wrong a stale plan can
+     * get is the ground covered while believing it, and a frame is not a fixed
+     * amount of ground - it is longer on a straight than in a hairpin, and
+     * longer again if the camera slows down. Counting frames only looked right
+     * while the motor lag stopped the car ever obeying the speed caps below;
+     * once it obeys, the same thirty frames become thirty frames of crawling and
+     * the car parks itself in the middle of a dropout it could have driven
+     * through. Metres do not have that problem.
+     */
+    if (s_st.lostFrames > 0u)
+    {
+#if SPEED_CLOSED_LOOP
+        s_blindM += SpeedCtl_State()->vEstMs * dt;
+#else
+        /* The open-loop path never runs the observer, so read the speed straight
+         * off the static map instead. It ignores the motor lag and so runs a
+         * little ahead of the truth, which errs toward stopping sooner. */
+        s_blindM += SpeedCtl_SpeedForDuty(s_speedCmd) * dt;
+#endif
+    }
+    else
+    {
+        s_blindM = 0.0f;
+    }
+
     if (running)
     {
         if (s_blindMs > CAM_TIMEOUT_MS)
         {
             v = 0.0f;
         }
-        else if (s_st.lostFrames > (uint16_t)LOST_STOP_FRAMES)
+        else if ((s_blindM > LOST_STOP_M) ||
+                 ((s_speedCmd < 6.0f) &&
+                  (s_st.lostFrames > (uint16_t)LOST_STOP_FRAMES)))
         {
+            /* The frame count survives only as the backstop for the one case
+             * distance cannot catch: a car that has already come to a halt
+             * covers no more ground, so its distance budget never runs out and
+             * it would sit there on the slow cap forever. Everywhere else the
+             * frame count must NOT get a vote - the moment the caps below take
+             * effect the car is crawling, and thirty frames of crawling is a
+             * few centimetres, so a frame-based stop would park the car inside
+             * every dropout it was perfectly able to drive through. */
             v = 0.0f;
         }
-        else if (s_st.lostFrames > (uint16_t)LOST_SLOW_FRAMES)
+        else if (s_blindM > LOST_SLOW_M)
         {
             float cap = SPEED_LOST * 0.5f;
             if (v > cap)
@@ -388,7 +498,7 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
                 v = cap;
             }
         }
-        else if (s_st.lostFrames > (uint16_t)LOST_COAST_FRAMES)
+        else if (s_blindM > LOST_COAST_M)
         {
             if (v > SPEED_LOST)
             {
@@ -405,7 +515,7 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
      * Only worth doing from a real speed, and only once per braking event: the pulse
      * is latched, runs down, and by the time it ends the speed command has already
      * been dropped to the new target. */
-#if BRAKE_ENABLE
+#if BRAKE_ENABLE && !SPEED_CLOSED_LOOP
     if (running && (s_brakeMs <= 0.0f) && (s_speedCmd > SPEED_MIN) &&
         ((s_speedCmd - v) > BRAKE_TRIGGER))
     {
@@ -423,6 +533,39 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
     }
 #endif
 
+#if SPEED_CLOSED_LOOP
+    /*
+     * The planner's number is a speed, not a duty. Hand it to speed_ctl, which
+     * inverts the measured duty->speed map and the 348 ms motor pole and returns
+     * the duty that actually produces it.
+     *
+     * This also replaces the reverse brake pulse above. The pulse existed
+     * because the old code could only drop the duty and wait; with the lag
+     * inverted, a falling speed reference produces a proportionally negative
+     * duty on its own - a metered brake instead of a fixed-length stab, and it
+     * stops braking exactly when the speed is right rather than when a timer
+     * expires.
+     */
+    if (!running)
+    {
+        SpeedCtl_Init();
+        s_speedCmd = 0.0f;
+    }
+    else
+    {
+        bool allowBrake = (s_st.elapsedMs >= (START_DELAY_MS + START_RAMP_MS));
+
+        float acc = s_st.exiting ? SPEED_ACC_EXIT_MS2 : SPEED_ACC_MS2;
+
+        s_speedCmd = SpeedCtl_Step(v, dt, allowBrake, acc);
+    }
+
+    /* The look-ahead and the racing line slide on how fast the car IS, not on
+     * what was asked for. Those differ by most of a second while the motor
+     * catches up, and during that second the old code was choosing its aim point
+     * for a speed the car had not reached. */
+    s_speedFrac = SpeedCtl_SpeedFrac();
+#else
     /* ---- speed ramp: ease on, drop instantly ---- */
     if (v > s_speedCmd)
     {
@@ -440,6 +583,7 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
     }
 
     s_speedFrac = clampf(s_speedCmd / SPEED_MAX, 0.0f, 1.0f);
+#endif
 
     /* ---- servo rate limit ---- */
     {

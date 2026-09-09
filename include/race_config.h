@@ -312,8 +312,102 @@
 #define STEER_KH                   30.0f
 #define STEER_KD                   4.0f
 
+/* =====================================================================
+ * GEOMETRIC STEERING (pure pursuit)
+ *
+ * STEER_KP is one number for every situation, but the thing it multiplies is
+ * not. The aim point is measured in pixels, and a pixel is worth more sideways
+ * travel the farther away the row is - so as LINE_LA_ROW slides outward with
+ * speed, the same KP means a different steering gain. sim/steering.py works out
+ * what the geometrically correct gain is at each look-ahead distance, and the
+ * fixed 78 crosses it at about 0.48 m: the car is under-geared below that and
+ * over-geared above it, which is why it runs wide out of slow corners and cuts
+ * into fast ones.
+ *
+ * The geometrically right law is pure pursuit. To reach a point y_la to the side
+ * at distance d_la, a bicycle of wheelbase L needs curvature 2*y_la/d_la^2, so
+ *
+ *     delta = 2 * L * y_la / d_la^2
+ *
+ * Both y_la and d_la come from the same camera, and the focal length cancels
+ * almost entirely. With Dx the aim point's pixel offset and w the corridor width
+ * in pixels at that row (which is how the firmware already measures distance,
+ * because width is inversely proportional to it):
+ *
+ *     y_la = Dx * d_la / f        d_la = f * W / w
+ *
+ *     delta = 2 * L * Dx * w / (f^2 * W)
+ *
+ * So the command is simply the aim-point offset multiplied by the corridor width
+ * there, and the only calibration left is L/W - wheelbase over track width, a
+ * ratio you can measure with a tape. No camera height, no tilt, no focal length
+ * beyond the Pixy2's own grid constant. Aim the camera differently and this law
+ * does not need retuning.
+ *
+ * It also removes the need for a separate curvature feedforward. On a curved
+ * path the aim point is already displaced by the arc's own sagitta, and pure
+ * pursuit converts exactly that displacement into exactly the steering angle the
+ * corner needs. Adding an explicit feedforward on top double-counts it, turns the
+ * car in early and cuts the apex - which is what STEER_KFF was measured doing.
+ * ===================================================================*/
+#ifndef STEER_PURE_PURSUIT
+#define STEER_PURE_PURSUIT         1
+#endif
+
+/* Car geometry. Only the ratio of these two matters. */
+#define CAR_WHEELBASE_M            0.170f
+#define TRACK_WIDTH_M              0.450f
+
+/* Road-wheel angle at a steering command of 100, radians. 30 degrees. */
+#define CAR_MAX_STEER_RAD          0.5236f
+
+#define STEER_PP_K                 ((200.0f * (CAR_WHEELBASE_M / TRACK_WIDTH_M)) \
+                                    / (PIXY_FOCAL_PX * PIXY_FOCAL_PX * CAR_MAX_STEER_RAD))
+
+/* Multiplier on the geometric value. 1.0 is textbook pure pursuit, which tracks
+ * a corner exactly but is leisurely about correcting a disturbance. Above 1.0
+ * corrects harder and tucks the car inside the geometric line. */
+#ifndef STEER_PP_SCALE
+#define STEER_PP_SCALE             1.30f
+#endif
+
 /* Heading that saturates the KH term, in pixels of x per row of y. */
 #define STEER_HEAD_SCALE           1.10f
+
+/*
+ * Curvature feedforward, steering units per unit of track curv.
+ *
+ * A constant-radius corner needs a constant steering angle, delta = L/R. A
+ * proportional controller can only produce a constant output from a standing
+ * error, so with KP alone the car MUST sit off the line by (L/R)/K for as long
+ * as the corner lasts. That is not a tuning fault, it is what proportional
+ * control is - and on a 90 cm corner it works out at about a quarter of a metre,
+ * which is more than the half-width of the track. It is exactly the error that
+ * stops a car holding an apex.
+ *
+ * track.c already measures curv = headFar - headNear, and sim/steering.py shows
+ * curv is proportional to real curvature at 0.97 (px/row) per (1/m) across the
+ * whole useful radius range. So the angle the corner needs can simply be handed
+ * to the servo before the error term is asked for any of it:
+ *
+ *     steer_ff = 100 * L * (curv / 0.97) / MAX_STEER_RAD  =  33 * curv
+ *
+ * Feedforward sits outside the loop, so it changes no margin and cannot
+ * destabilise anything. The default is deliberately below the geometric 33:
+ * the estimate runs short in tight corners, and under-delivering is the safe
+ * direction because the proportional term simply picks up the remainder.
+ */
+#ifndef STEER_KFF
+#define STEER_KFF                  0.0f
+#endif
+
+/* Largest curvature the feedforward will believe, in the same px-per-row units.
+ * 2.0 corresponds to a half-metre radius - tighter than an NXP Cup layout puts
+ * down, so anything past it is an S bend being misread as a corner rather than a
+ * corner that is really that tight. */
+#ifndef STEER_KFF_CURV_MAX
+#define STEER_KFF_CURV_MAX         2.00f
+#endif
 
 /* Servo rate limit, steering units per second. Stops the linkage from slamming. */
 #define STEER_SLEW_PER_S           900.0f
@@ -326,12 +420,51 @@
  * ===================================================================*/
 /* THE headline number. Start at 65, raise it 5 at a time. */
 #ifndef SPEED_MAX
-#define SPEED_MAX                  75.0f
+#define SPEED_MAX                  100.0f
 #endif
 
-/* Slowest the car is allowed to go while it can still see the track. */
+/*
+ * Slowest the car is allowed to go while it can still see the track.
+ *
+ * This, SPEED_SEVERITY_FULL and STEER_PP_SCALE are the three that trade lap time
+ * against margin. test/pick.py scores a candidate on all three test sets at once
+ * - the five circuits, the fault suite, and the 18 camera mountings inside the
+ * aim envelope - because a tuning search given only lap time will happily sell
+ * the mounting robustness to buy a second, and the car then depends on the
+ * bracket being exactly where it was when the tune was found.
+ *
+ * Measured ladder (total of the five circuits, all with zero line contact):
+ *
+ *   MIN 60, SEV 1.00, PP 1.6   48.69 s   18/18 mountings  8/8 faults
+ *   MIN 68, SEV 1.00, PP 1.6   44.78 s   16/18 mountings  8/8 faults
+ *   MIN 76, SEV 1.30, PP 1.3   41.74 s   15/18 mountings  8/8 faults  <- default
+ *
+ * For reference the old open-loop firmware managed 51.76 s at 18/18 and 7/8, and
+ * 43.08 s at 16/18 and 5/8.
+ *
+ * What the default gives up, precisely. `track_sim -envelope` lists all 18 and
+ * marks each one. The three the default fails are:
+ *
+ *   f=55 h=26 hz=-6  track=45 R=60      f=55 h=26 hz=-6  track=45 R=80
+ *   f=80 h=26 hz=-10 track=45 R=80
+ *
+ * Every single one is the narrowest track, 45 cm. On a 55 cm or 60 cm track the
+ * default is clean on all ten of those mountings, and at the Pixy2's real focal
+ * length (68 px; the sweep varies it 55-80 to cover uncertainty in that constant)
+ * it is clean on all four with 3.2 to 8.5 cm to spare.
+ *
+ * So: TRACK WIDTH is the thing to check, not the bracket. Measured on a 45 cm
+ * track, counting how many of those eight mountings cross a line:
+ *
+ *   MIN 76, SEV 1.30, PP 1.3   41.74 s   3 of 8 fail   worst -34.5 cm
+ *   MIN 68, SEV 1.00, PP 1.6   44.78 s   2 of 8 fail   worst  -9.0 cm
+ *   MIN 64, SEV 1.00, PP 1.6   44.97 s   1 of 8 fail   worst  -6.5 cm
+ *   MIN 60, SEV 1.00, PP 1.6   48.69 s   0 of 8 fail   worst  +0.3 cm
+ *
+ * On a 45 cm track only the last one is safe, and even that clears by 3 mm.
+ */
 #ifndef SPEED_MIN
-#define SPEED_MIN                  44.0f
+#define SPEED_MIN                  76.0f
 #endif
 
 /* Global scale, handy for a quick trackside calm-down. 1.0 = full. */
@@ -344,7 +477,9 @@
 #define SPEED_W_STEER              0.90f
 
 /* Corner severity that pins the car at SPEED_MIN. */
-#define SPEED_SEVERITY_FULL        1.00f
+#ifndef SPEED_SEVERITY_FULL
+#define SPEED_SEVERITY_FULL        1.30f
+#endif
 
 /* You may only drive as fast as you can see. Speed is scaled by how far ahead the
  * track model is still valid. */
@@ -362,6 +497,84 @@
 /* Acceleration is ramped, braking is instant - same as a real car. Units per second. */
 #define SPEED_ACCEL_PER_S          140.0f
 #define SPEED_ACCEL_EXIT_PER_S     260.0f  /* corner exit: get on the power hard */
+
+/* =====================================================================
+ * LONGITUDINAL PLANT - what the motors actually do
+ *
+ * Identified in sim/plant.py from the 25GA-370 datasheet points (12 V, 1000 rpm
+ * out, 0.12 A no load, 3.0 A stall -> 1:9.6 gearing, R = 4.36 ohm, Ke = Kt =
+ * 0.01146, tau_mech = 348 ms) and validated there against a PWM-resolved model
+ * that integrates the winding current at 2 us. Re-run sim/identify.py after
+ * changing any of it.
+ *
+ *     duty -> wheel speed   G(s) = K / (tau*s + 1)
+ *
+ * If the car is measurably faster or slower than SPEED_TOP_MS on a straight,
+ * that is the number to correct first: everything else is scaled by it.
+ * ===================================================================*/
+
+/* Steady speed at 100% duty, m/s. Scales with battery voltage - 2.01 at 8.0 V,
+ * 1.73 at 7.0 V, 3.12 at a full 12 V. Measure it once with a tape and a stopwatch. */
+#ifndef SPEED_TOP_MS
+#define SPEED_TOP_MS               2.01f
+#endif
+
+#define MOTOR_K_MS_PER_DUTY        2.226f  /* m/s per unit duty, no load */
+#define MOTOR_TAU_S                0.348f  /* dominant pole */
+
+/*
+ * Which way the bridge decays during the PWM off-time, going forwards.
+ *
+ * The wiring is one GPIO direction pin plus one PWM pin per motor, and that
+ * gives coast-during-off in one direction and brake-during-off in the other.
+ * Forwards is currently the coast one, which is the worse half of the deal:
+ * a 30% deadband, an S-shaped duty-speed curve, twice the speed lost to a given
+ * drag, and three times the current ripple. Brake decay is nearly a straight
+ * line through the origin.
+ *
+ * Swapping the two motor wires at both motors and setting MOTOR1_INVERT and
+ * MOTOR2_INVERT to 1 puts forward on the brake-decay branch instead, at which
+ * point set this to 0. Worth about a second a lap - test/compare.sh measures it.
+ */
+#ifndef MOTOR_FAST_DECAY_FWD
+#define MOTOR_FAST_DECAY_FWD       1
+#endif
+
+/* Set to 1 once a wheel speed sensor exists and SpeedCtl_Measure() is being
+ * called. Only the integral term needs it, but the integral term is the only
+ * thing that can reject a drag disturbance. */
+#ifndef SPEED_HAVE_FEEDBACK
+#define SPEED_HAVE_FEEDBACK        0
+#endif
+
+/* PI gains, by pole cancellation at a 12 rad/s closed loop: Kp = tau*w/K,
+ * Ki = Kp/tau. Expressed in duty percent per (m/s). Unused unless
+ * SPEED_HAVE_FEEDBACK is 1. */
+#define SPEED_KP                   187.6f
+#define SPEED_KI                   539.1f
+#define SPEED_I_LIMIT              0.60f
+
+/* How much of the 348 ms lag to invert. 1.0 is exact inversion; below 1.0 is
+ * gentler on the bridge, above 1.0 overdrives. Drop it if the car surges. */
+#ifndef SPEED_FF_LAG
+#define SPEED_FF_LAG               1.00f
+#endif
+
+/* Reference shaping, m/s^2. The car can manage about 3.5 m/s^2 at mid speed,
+ * so asking for much more than that only saturates the bridge. The decel limit
+ * is what the feedforward turns into a reverse command; COAST is used instead
+ * whenever braking is not allowed. */
+#define SPEED_ACC_MS2              3.00f
+#define SPEED_ACC_EXIT_MS2         6.00f  /* corner exit: let the reference run
+                                           * ahead so the duty pins at 100% */
+#define SPEED_DEC_MS2              6.00f
+#define SPEED_COAST_MS2            2.50f
+
+/* Master switch. 0 falls back to the original open-loop ramp and reverse brake
+ * pulse, which is how test/compare.sh measures what this is worth. */
+#ifndef SPEED_CLOSED_LOOP
+#define SPEED_CLOSED_LOOP          1
+#endif
 
 /* =====================================================================
  * BRAKING - short reverse pulse when the speed demand drops hard
@@ -406,6 +619,22 @@
 #define LOST_SLOW_FRAMES           10
 #define LOST_STOP_FRAMES           30
 #define SPEED_LOST                 20.0f
+
+/* The same three stages, measured in metres of track covered blind rather than
+ * in camera frames. Distance is the honest unit: a frame is a different amount
+ * of ground on a straight than in a hairpin, and a different amount again if the
+ * camera rate drops. The frame counters above only behaved because the motor lag
+ * stopped the car ever reaching the speeds they asked for; a car that obeys them
+ * crawls, and thirty frames of crawling is barely a hand's width of track. */
+#ifndef LOST_COAST_M
+#define LOST_COAST_M               0.12f
+#endif
+#ifndef LOST_SLOW_M
+#define LOST_SLOW_M                0.35f
+#endif
+#ifndef LOST_STOP_M
+#define LOST_STOP_M                0.75f
+#endif
 
 /* If the camera says nothing at all for this long, cut the motors. */
 #define CAM_TIMEOUT_MS             350.0f

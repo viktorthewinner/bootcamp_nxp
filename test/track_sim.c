@@ -187,9 +187,171 @@ typedef struct
 
 #define WHEELBASE      17.0
 #define MAX_STEER_RAD  (30.0 * M_PI / 180.0)
-#define SPEED_UNIT_CMS 3.6   /* cm/s per command unit: 100 units ~ 3.6 m/s */
 #define GRIP_G         1.05  /* lateral grip, in g */
-#define ACCEL_LAG      6.0   /* how quickly real speed follows the command, 1/s */
+
+/* ------------------------------------------------------------------ *
+ * Drivetrain: 2 x 25GA-370 through a DRV8833.
+ *
+ * These are not invented. They are derived in sim/plant.py from the published
+ * motor numbers (12 V, 1000 rpm out, 0.12 A no load, 3.0 A stall) and validated
+ * there against a PWM-resolved model that integrates the winding current at
+ * 2 us. Keep the two in step: plant.py is the source of truth.
+ *
+ * The old model here was  v += (v_cmd*3.6 - v) * 6.0 * dt,  i.e. a 167 ms lag
+ * onto a top speed of 3.6 m/s. The real machine is a 348 ms lag onto 2.0 m/s at
+ * a DRV8833-legal 8 V, so the old model was flattering the car about twice over.
+ * ------------------------------------------------------------------ */
+#define MOT_GEAR_N     9.6
+#define MOT_GEAR_EFF   0.70
+#define MOT_R          4.36      /* armature + bridge on-resistance, ohm */
+#define MOT_L          2.0e-3    /* H */
+#define MOT_KE         0.011460  /* V*s/rad */
+#define MOT_KT         0.011460  /* N*m/A   */
+#define MOT_B          1.368e-6  /* N*m*s/rad */
+#define MOT_TCOUL      1.6e-3    /* N*m at the armature */
+#define MOT_ILIMIT     2.0       /* A, DRV8833 bridge limit */
+#define MOT_VDIODE     0.9       /* V, body diode drop in fast decay */
+#define MOT_PWM_HZ     1000.0    /* CTIMER0: 2343750 / 2343 */
+
+#ifndef SIM_VBAT
+#define SIM_VBAT       8.0       /* 2S LiPo. DRV8833 tops out at 10.8 V. */
+#endif
+
+/* The bridge is wired DIR pin + PWM pin, which gives coast-during-off going
+ * forwards and brake-during-off in reverse. Set to 0 to model the slow-decay
+ * wiring instead and see what it is worth. */
+#ifndef SIM_FAST_DECAY_FWD
+#define SIM_FAST_DECAY_FWD 1
+#endif
+
+#define CAR_MASS       1.20      /* kg, car with battery */
+#define WHEEL_R        0.032     /* m */
+#define REAR_TRACK     0.15      /* m */
+#define C_ROLL         0.015
+#define C_DRAG         0.0035    /* N/(m/s)^2 */
+
+/* Rotating inertia referred to the road, so the whole drivetrain is one degree
+ * of freedom: m_eff = m + 2*J_mot*N^2*eff/r^2 + 2*J_wheel/r^2. */
+#define J_MOT          1.2e-6
+#define J_WHEEL        1.5e-5
+#define CAR_MASS_EFF   (CAR_MASS \
+                        + (2.0 * J_MOT * MOT_GEAR_N * MOT_GEAR_N * MOT_GEAR_EFF \
+                           / (WHEEL_R * WHEEL_R)) \
+                        + (2.0 * J_WHEEL / (WHEEL_R * WHEEL_R)))
+
+/* Latency the old model did not have at all: the frame the controller acts on
+ * describes where the car WAS, and the servo does not step. */
+#ifndef SIM_SENSE_DELAY_S
+#define SIM_SENSE_DELAY_S 0.030
+#endif
+#ifndef SIM_SERVO_TAU_S
+#define SIM_SERVO_TAU_S   0.060
+#endif
+
+/*
+ * Average winding current over one PWM period, in closed form.
+ *
+ * The electrical time constant is 0.46 ms against a 348 ms mechanical one, so
+ * within a PWM period the speed is a constant and the current waveform can be
+ * solved instead of integrated. Over the on-time the current heads for
+ * (V - E)/R; over the off-time it heads for -E/R when the bridge brakes, or
+ * -(V + 2*Vd + E)/R when it coasts into the body diodes. Integrating both
+ * exponentials and using i(t_z) = 0 at the zero crossing, everything cancels
+ * except
+ *
+ *     <i> = ( I_on * t_on + I_off * min(t_z, t_off) ) / T
+ *
+ * which is exact in both continuous and discontinuous conduction.
+ *
+ * Braking shorts the winding, so current may reverse and conduction is always
+ * continuous. Coasting cannot: the diodes block, and below about 30% duty the
+ * winding spends part of every period open. That is the deadband the car has
+ * going forwards today.
+ */
+static double motor_avg_current(double duty, double wArm, int fastDecay)
+{
+    double d    = fabs(duty);
+    double sgn  = (duty >= 0.0) ? 1.0 : -1.0;
+    double tau  = MOT_L / MOT_R;
+    double T    = 1.0 / MOT_PWM_HZ;
+    double tOn  = d * T;
+    double tOff = T - tOn;
+    double emf  = MOT_KE * wArm * sgn;
+    double iOn  = (SIM_VBAT - emf) / MOT_R;
+    double iOff, tZ, iAvg;
+
+    if (d > 1.0) { d = 1.0; tOn = T; tOff = 0.0; }
+    if (iOn >  MOT_ILIMIT) iOn =  MOT_ILIMIT;
+    if (iOn < -MOT_ILIMIT) iOn = -MOT_ILIMIT;
+
+    if (!fastDecay)
+    {
+        iOff = -emf / MOT_R;
+        tZ   = tOff;
+    }
+    else
+    {
+        double a = exp(-tOn / tau);
+        double b = exp(-tOff / tau);
+        double den, iMin, iPeak;
+
+        iOff = (-(SIM_VBAT + (2.0 * MOT_VDIODE)) - emf) / MOT_R;
+        den  = 1.0 - (a * b);
+        if (den < 1e-12) den = 1e-12;
+        iMin = ((iOff * (1.0 - b)) + (iOn * b * (1.0 - a))) / den;
+
+        if (iMin > 0.0)
+        {
+            tZ = tOff;                       /* continuous conduction */
+        }
+        else
+        {
+            iPeak = iOn * (1.0 - a);
+            if (iPeak >  MOT_ILIMIT) iPeak =  MOT_ILIMIT;
+            if (iPeak < -MOT_ILIMIT) iPeak = -MOT_ILIMIT;
+
+            if (fabs(iPeak) < 1e-12)
+                tZ = 0.0;                    /* never conducted at all */
+            else if ((iPeak > 0.0) && (iOff < 0.0))
+                tZ = tau * log(1.0 + (iPeak / -iOff));
+            else if ((iPeak < 0.0) && (iOff > 0.0))
+                tZ = tau * log(1.0 + (-iPeak / iOff));
+            else
+                tZ = tOff;
+
+            if (tZ > tOff) tZ = tOff;
+            if (tZ < 0.0)  tZ = 0.0;
+        }
+    }
+
+    iAvg = ((iOn * tOn) + (iOff * tZ)) / T;
+    if (iAvg >  MOT_ILIMIT) iAvg =  MOT_ILIMIT;
+    if (iAvg < -MOT_ILIMIT) iAvg = -MOT_ILIMIT;
+    return sgn * iAvg;
+}
+
+/* Wheel force in newtons from one motor at a given duty and road speed. */
+static double motor_force(double cmdPercent, double vWheel)
+{
+    double duty = cmdPercent / 100.0;
+    double wArm = vWheel * MOT_GEAR_N / WHEEL_R;
+    double i, t;
+    int    fast;
+
+    if (duty >  1.0) duty =  1.0;
+    if (duty < -1.0) duty = -1.0;
+
+    fast = (duty >= 0.0) ? SIM_FAST_DECAY_FWD : 0;
+
+    i = motor_avg_current(duty, wArm, fast);
+    t = (MOT_KT * i) - (MOT_B * wArm);
+    if (fabs(wArm) > 1.0)
+        t -= (wArm > 0.0) ? MOT_TCOUL : -MOT_TCOUL;
+    else if (fabs(t) < MOT_TCOUL)
+        t = 0.0;
+
+    return t * MOT_GEAR_N * MOT_GEAR_EFF / WHEEL_R;
+}
 
 /* ------------------------------------------------------------------ */
 
@@ -253,6 +415,18 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
     int        hint = 0;
     int        frameDiv = 0;
     double     lapLen;
+    double     servoAngle = 0.0;
+    double     yawPrev = 0.0;
+
+    /* Pose history, so the camera can be shown where the car WAS. Rendering the
+     * frame from the current pose hands the controller information it cannot
+     * have, and quietly hides every delay-driven stability problem. */
+    #define POSE_HIST 128
+    double hx[POSE_HIST], hy[POSE_HIST], hth[POSE_HIST];
+    int    hidx[POSE_HIST];
+    int    hw = 0;
+    int    hLag = (int)((SIM_SENSE_DELAY_S / dt) + 0.5);
+    int    hFilled = 0;
 
 
     memset(&r, 0, sizeof(r));
@@ -283,15 +457,34 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
         idx  = nearest_idx(car.x, car.y, hint);
         hint = idx;
 
+        /* Record where the car is now, and pick out where it was one sensor
+         * delay ago - that is the pose the next camera frame describes. */
+        hx[hw] = car.x; hy[hw] = car.y; hth[hw] = car.th; hidx[hw] = idx;
+        hw = (hw + 1) % POSE_HIST;
+        if (hFilled < POSE_HIST) hFilled++;
+
         /* --- camera frame at 60 Hz, control loop at 250 Hz --- */
         fresh = false;
         if (++frameDiv >= 4)
         {
             int k;
+            int hr = (hw - 1 - hLag + (2 * POSE_HIST)) % POSE_HIST;
+            double sx, sy, sth;
+            int    sidx;
+
+            if (hFilled > hLag)
+            {
+                sx = hx[hr]; sy = hy[hr]; sth = hth[hr]; sidx = hidx[hr];
+            }
+            else
+            {
+                sx = car.x; sy = car.y; sth = car.th; sidx = idx;
+            }
+
             frameDiv = 0;
-            k = render_edge(cam, car.x, car.y, car.th, idx, +1.0, allSegs, 4);
+            k = render_edge(cam, sx, sy, sth, sidx, +1.0, allSegs, 4);
             n = (uint8_t)k;
-            k = render_edge(cam, car.x, car.y, car.th, idx, -1.0, allSegs + n,
+            k = render_edge(cam, sx, sy, sth, sidx, -1.0, allSegs + n,
                             PIXY_MAX_VECTORS - n);
             n = (uint8_t)(n + k);
             fresh = true;
@@ -321,14 +514,35 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
 
         /* --- vehicle --- */
         {
+            /* The servo does not step. The firmware already rate-limits its
+             * command; this is the linkage and the servo loop on top of it. */
+            double delta, vMs, vL, vR, fL, fR, fNet, yaw;
+
+            servoAngle += (cmd.steer - servoAngle) * (dt / (SIM_SERVO_TAU_S + dt));
+
             /* Firmware convention: + steer = turn RIGHT. World frame here has
              * increasing heading = turn LEFT, hence the negation. */
-            double delta = -(cmd.steer / 100.0) * MAX_STEER_RAD;
-            double vTarget;
-            double yaw;
+            delta = -(servoAngle / 100.0) * MAX_STEER_RAD;
 
-            vTarget = ((cmd.left + cmd.right) * 0.5) * SPEED_UNIT_CMS;
-            car.v += (vTarget - car.v) * ACCEL_LAG * dt;
+            /* Two independent motors, so the wheels turn at different speeds
+             * through a corner and each sees its own back-EMF. That is what
+             * makes torque vectoring cost something as well as buy something. */
+            vMs = car.v / 100.0;
+            vL  = vMs - (yawPrev * REAR_TRACK * 0.5);
+            vR  = vMs + (yawPrev * REAR_TRACK * 0.5);
+
+            fL = motor_force(cmd.left, vL);
+            fR = motor_force(cmd.right, vR);
+
+            fNet = fL + fR;
+            if (vMs > 0.01)
+                fNet -= C_ROLL * CAR_MASS * 9.81;
+            else if (vMs < -0.01)
+                fNet += C_ROLL * CAR_MASS * 9.81;
+            fNet -= C_DRAG * vMs * fabs(vMs);
+
+            vMs += (fNet / CAR_MASS_EFF) * dt;
+            car.v = vMs * 100.0;
             if (car.v < 0.0) car.v = 0.0;
 
             yaw = (car.v / WHEELBASE) * tan(delta);
@@ -341,6 +555,7 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
                 if (yaw > yawMax) yaw = yawMax;
                 if (yaw < -yawMax) yaw = -yawMax;
             }
+            yawPrev = yaw;
 
             car.th += yaw * dt;
             car.x += car.v * cos(car.th) * dt;
@@ -448,10 +663,46 @@ static void report(const Result *r)
            "", r->oneEdgeFrames, r->lostFrames, r->chicaneFrames);
 }
 
+/*
+ * Steady-state duty -> speed of the model above, so it can be checked against
+ * sim/plant.py, which is where these parameters were identified and validated
+ * against a PWM-resolved simulation. The two are separate implementations of the
+ * same equations; if they ever disagree, one of them has drifted.
+ */
+static void dump_motor_map(void)
+{
+    int i;
+
+    printf("duty  speed m/s   (compare: python sim/plant.py map)\n");
+    for (i = 0; i <= 10; i++)
+    {
+        double duty = i * 10.0;
+        double v = 0.0;
+        int    k;
+
+        for (k = 0; k < 200000; k++)
+        {
+            double f = 2.0 * motor_force(duty, v);
+
+            if (v > 0.01) f -= C_ROLL * CAR_MASS * 9.81;
+            f -= C_DRAG * v * fabs(v);
+            v += (f / CAR_MASS_EFF) * 1.0e-4;
+            if (v < 0.0) v = 0.0;
+        }
+        printf("%4.0f  %9.4f\n", duty, v);
+    }
+}
+
 int main(int argc, char **argv)
 {
     Cam cam;
     int verbose = (argc > 1 && strcmp(argv[1], "-v") == 0);
+
+    if (argc > 1 && strcmp(argv[1], "-motormap") == 0)
+    {
+        dump_motor_map();
+        return 0;
+    }
     int only = -1;
     if (argc > 3 && strcmp(argv[1], "-d") == 0)
     {
@@ -488,8 +739,15 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    if (argc > 1 && strcmp(argv[1], "-sweep") == 0)
+    /* -envelope runs only the sanely aimed mountings, which is the subset a
+     * tuning search actually has to respect. It is 18 runs instead of 162, so it
+     * is cheap enough to sit inside a search loop rather than being checked
+     * afterwards - and checking afterwards is how a search ends up selling the
+     * camera robustness to buy a second. */
+    if (argc > 1 && (strcmp(argv[1], "-sweep") == 0 ||
+                     strcmp(argv[1], "-envelope") == 0))
     {
+        int onlyEnv = (strcmp(argv[1], "-envelope") == 0);
         static const double F[]  = { 55.0, 68.0, 80.0 };
         static const double H[]  = { 12.0, 18.0, 26.0 };
         static const double HZ[] = { -10.0, -6.0, -3.0 };
@@ -540,6 +798,11 @@ int main(int argc, char **argv)
                          halfViewMid >= HW[d]);
             }
 
+            if (onlyEnv && !inEnv)
+            {
+                continue;
+            }
+
             sprintf(nm, "f=%.0f h=%.0f hz=%+.0f track=%.0f R=%.0f", F[a], H[b], HZ[c],
                     2 * HW[d], RAD[e]);
             r = run(t, 7, &cm, HW[d], 0.0, nm, 0, 40.0);
@@ -549,10 +812,14 @@ int main(int argc, char **argv)
             else       { nS++; if (r.finished) finS++; if (r.excursions == 0) cleanS++;
                          if (r.minClear < worstS) worstS = r.minClear; }
 
-            if (r.excursions > 0 || !r.finished)
-                printf("  %-11s %-38s finished=%-4s excursions=%-5d minClear=%+.2fcm\n",
+            /* -envelope lists all 18, because when a tuning fails on some of them
+             * the useful question is which ones - that is what tells you whether
+             * your own bracket is anywhere near the ones that broke. */
+            if (onlyEnv || r.excursions > 0 || !r.finished)
+                printf("  %-11s %-38s finished=%-4s excursions=%-5d minClear=%+.2fcm%s\n",
                        inEnv ? "IN-ENVELOPE" : "stress", nm,
-                       r.finished ? "yes" : "NO", r.excursions, r.minClear);
+                       r.finished ? "yes" : "NO", r.excursions, r.minClear,
+                       (onlyEnv && r.excursions == 0) ? "  ok" : "");
         }
 
         printf("\nIN ENVELOPE : %d configurations, %d finished, %d with zero excursions, worst clearance %+.2f cm\n",
