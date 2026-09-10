@@ -53,6 +53,17 @@ typedef struct
     volatile status_t          result;
     uint32_t                   errors;   /* running count, useful while debugging */
     uint32_t                   timeouts;
+
+    /* The Pixy2's own junction detector, when PIXY_WANT_INTERSECTIONS is on.
+     * Refreshed every frame, zero on frames where the camera saw none. It is a
+     * second opinion reached from the whole image rather than from the handful
+     * of vectors that reach this driver - recorded for comparison, not steered
+     * on. The decision is made in intersection.c, on geometry that the host
+     * simulator can actually exercise. */
+    uint8_t                    interCount;    /* junctions reported this frame */
+    uint8_t                    interX;        /* grid position of the first    */
+    uint8_t                    interY;
+    uint8_t                    interBranches; /* branches leaving it           */
 } pixy_t;
 
 void     pixy_init(pixy_t *cam, LPI2C_Type *inst, uint8_t addr,

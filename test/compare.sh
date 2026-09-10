@@ -10,7 +10,8 @@ OUT="$HERE/track_sim_cmp"
 ${CC:-gcc} -O1 -std=gnu99 -o "$OUT" \
     "$HERE/track_sim.c" "$HERE/../source/track.c" \
     "$HERE/../source/racing_line.c" "$HERE/../source/driver.c" \
-    "$HERE/../source/speed_ctl.c" \
+    "$HERE/../source/speed_ctl.c" "$HERE/../source/intersection.c" \
+    "$HERE/../source/recover.c" \
     -I"$HERE/../include" -DRACE_BENCH_MODE=0 "$@" -lm
 "$OUT" | awk '
   function num(s, key,   p) {

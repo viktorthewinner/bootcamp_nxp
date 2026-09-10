@@ -26,6 +26,7 @@
 #include "track.h"
 #include "racing_line.h"
 #include "driver.h"
+#include "intersection.h"
 #include "hbridge.h"
 #include "servo.h"
 #if RACE_TELEMETRY
@@ -131,6 +132,19 @@ int main(void)
         {
             vectors_to_segments(s_vectors, n, s_segments);
         }
+
+        /*
+         * Hand over the camera's own junction verdict for this frame.
+         *
+         * Unconditionally, and false when the frame did not arrive: a stale
+         * "yes" is the one way this could vouch for a corner it never saw,
+         * so a dropped frame has to clear it rather than leave it standing.
+         * pixy_get_vectors zeroes interCount at entry, so a failed read
+         * already reports none - this just makes that explicit.
+         */
+        Xsec_CameraHint(fresh && (cam.interCount > 0u),
+                        (float)cam.interX, (float)cam.interY,
+                        cam.interBranches);
 
         now   = Ticks_Us();
         dt    = (float)(now - tPrev) * 1.0e-6f;

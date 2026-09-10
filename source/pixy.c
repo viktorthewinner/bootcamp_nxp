@@ -1,6 +1,7 @@
 #include "pixy.h"
 #include "peripherals.h"
 #include "ticks.h"
+#include "race_config.h"
 #include <string.h>
 
 /* ---- Pixy2 wire protocol ------------------------------------------------ */
@@ -20,6 +21,7 @@
 
 #define LINE_GET_ALL        0x01u  /* every vector, not just the one Pixy picked */
 #define LINE_FEATURE_VECTOR 0x01u
+#define LINE_FEATURE_INTERS 0x02u  /* the camera's own junction detector */
 
 #define HDR_LEN             6u     /* sync(2) type(1) length(1) checksum(2) */
 #define PIXY_BUF_LEN        96u
@@ -283,9 +285,32 @@ status_t pixy_get_vectors(pixy_t *cam, PixyVector *out, uint8_t max, uint8_t *co
     status_t s;
 
     *count = 0u;
+#if PIXY_WANT_INTERSECTIONS
+    cam->interCount = 0u; /* per frame, not cumulative */
+#endif
 
-    req[0] = LINE_GET_ALL;        /* every vector, so both track edges come back */
-    req[1] = LINE_FEATURE_VECTOR; /* vectors only - intersections and barcodes are noise here */
+    req[0] = LINE_GET_ALL; /* every vector, so both track edges come back */
+#if PIXY_WANT_INTERSECTIONS
+    /*
+     * Vectors AND the camera's own intersection blocks.
+     *
+     * The Pixy2 runs its own junction detector and will report where it thinks
+     * the branches are. That is a genuinely independent second opinion, arrived
+     * at from the full image rather than from the handful of vectors that
+     * survive to this driver, and it costs only the few bytes of one extra
+     * block on the frames where there is something to report.
+     *
+     * It is a second opinion and not the decision. It cannot be exercised
+     * against the host simulator - there is no Pixy2 firmware to run - so the
+     * car does not steer or brake on it. intersection.c decides on the geometry
+     * of the vectors, which is testable; this is recorded alongside so the two
+     * can be compared on a real capture, and so the confirmation can be made
+     * quicker once they have been seen to agree on a real track.
+     */
+    req[1] = (uint8_t)(LINE_FEATURE_VECTOR | LINE_FEATURE_INTERS);
+#else
+    req[1] = LINE_FEATURE_VECTOR;
+#endif
 
     s = pixy_send(cam, LINE_REQ_FEATURES, req, 2u);
     if (s != kStatus_Success)
@@ -351,6 +376,29 @@ status_t pixy_get_vectors(pixy_t *cam, PixyVector *out, uint8_t max, uint8_t *co
                 out[n].flags = v[5];
                 n++;
             }
+        }
+#if PIXY_WANT_INTERSECTIONS
+        else if ((fType == LINE_FEATURE_INTERS) && (fLen >= 4u))
+        {
+            /* [x][y][branches][reserved], then one 4 byte record per branch
+             * carrying its index and angle. Only the header is kept: what
+             * matters here is that the camera agrees something is there, and
+             * roughly where - the geometry is decided in intersection.c from
+             * the vectors, which can be tested. */
+            const uint8_t *d = &buf[idx + 2u];
+
+            cam->interX        = d[0];
+            cam->interY        = d[1];
+            cam->interBranches = d[2];
+            if (cam->interCount < 0xFFu)
+            {
+                cam->interCount++;
+            }
+        }
+#endif
+        else
+        {
+            /* a feature this driver does not use */
         }
 
         idx = (uint8_t)(idx + 2u + fLen);

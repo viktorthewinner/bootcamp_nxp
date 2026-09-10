@@ -1,9 +1,14 @@
 #include "telemetry.h"
 #include "race_config.h"
 
-/* SRAMX, no-init: nothing else in this project uses it, and the log survives a reset
- * so a crash or a debugger attach does not throw away the run that caused it. */
-TlmBuffer g_tlm __attribute__((section(".noinit.$SRAMX")));
+/* Main SRAM, no-init.
+ *
+ * NOT SRAMX. LinkServer stages its flash driver (binaries/Flash/MCXNxxx.cfx) at
+ * 0x04000000 during chip setup - it is an ELF linked to load AND execute there -
+ * so a buffer in SRAMX is overwritten by the act of connecting to read it. Main
+ * SRAM is untouched by the probe; at ~94 KB this still leaves over 280 KB free
+ * below the stack at 0x2005F000. */
+TlmBuffer g_tlm __attribute__((section(".noinit.$SRAM")));
 
 static int16_t sat16(float v)
 {
@@ -20,13 +25,28 @@ static int16_t sat16(float v)
 
 void Telemetry_Init(void)
 {
+    /* Only wipe the log when what is in RAM is not one this build can read.
+     * Clearing unconditionally - which is what this did - meant every reset threw
+     * the drive away, including the reset the debugger causes when it attaches to
+     * read it. That contradicted the promise in telemetry.h that the log survives.
+     *
+     * reserved[0] counts boots, so a dump spanning a reset can still be split. */
+    if ((g_tlm.header.magic == TLM_MAGIC) &&
+        (g_tlm.header.version == (uint16_t)TLM_VERSION) &&
+        (g_tlm.header.recordSize == (uint16_t)sizeof(TlmRecord)) &&
+        (g_tlm.header.slots == TLM_SLOTS))
+    {
+        g_tlm.header.reserved[0]++;
+        return;
+    }
+
     g_tlm.header.magic       = TLM_MAGIC;
     g_tlm.header.version     = (uint16_t)TLM_VERSION;
     g_tlm.header.recordSize  = (uint16_t)sizeof(TlmRecord);
     g_tlm.header.slots       = TLM_SLOTS;
     g_tlm.header.count       = 0u;
     g_tlm.header.uptimeMs    = 0u;
-    g_tlm.header.reserved[0] = 0u;
+    g_tlm.header.reserved[0] = 1u;
     g_tlm.header.reserved[1] = 0u;
 }
 
@@ -90,6 +110,20 @@ void Telemetry_Log(const DriveState *st,
     }
 #if RACE_BENCH_MODE
     f |= TLM_F_BENCH;
+#endif
+
+#if XSEC_ENABLE
+    if (st->xsec.phase == XSEC_CROSSING)
+    {
+        f |= TLM_F_XSEC;
+    }
+#endif
+
+#if XSEC_ENABLE
+    if (st->xsec.camAgreed)
+    {
+        r->nValid |= TLM_NV_CAMXSEC;
+    }
 #endif
     r->flags = f;
 

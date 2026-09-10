@@ -1,6 +1,8 @@
 #include "driver.h"
 #include "race_config.h"
 #include "speed_ctl.h"
+#include "intersection.h"
+#include "recover.h"
 #include <math.h>
 
 static DriveState s_st;
@@ -19,6 +21,11 @@ static float s_frameDt;     /* smoothed gap between camera frames, seconds */
 static float s_frameDtBest; /* the best this camera has managed - learned      */
 static float s_brakeMs;
 static float s_brakeMag;
+static float s_xsecM;     /* metres driven since the last camera frame */
+static float s_steerHold; /* steering to freeze if a crossing turns up  */
+static float s_headHold;  /* the near heading behind it, same filter    */
+static float s_xsecV;     /* speed frozen on the way into a crossing    */
+static uint8_t s_chordFrames; /* consecutive frames with no bend measurable */
 
 static float clampf(float v, float lo, float hi)
 {
@@ -79,6 +86,46 @@ static float ramp01(float v, float ignore, float full)
     return clampf((fabsf(v) - ignore) / span, 0.0f, 1.0f);
 }
 
+/*
+ * Speed to hold through a recognised crossing.
+ *
+ * Not simply flat out. Inside the junction there is nothing left to plan from,
+ * so the right answer is the one the car had already arrived at on the approach
+ * - which on a straight IS flat out, because nothing was slowing it, and on a
+ * bend is the speed that bend was asking for. Commanding maximum regardless
+ * would mean a junction sitting in a corner cancelled the braking for the
+ * corner, which is a good way to lose a car that was about to turn.
+ *
+ * Floored so that a momentary dip on the way in cannot leave the car crawling,
+ * or stopped, in the middle of a junction - the failure this whole module
+ * exists to prevent.
+ */
+static float xsec_hold_speed(void)
+{
+    float v = s_xsecV;
+
+#if XSEC_FULL_POWER
+    /*
+     * Not the speed the approach settled on - all of it.
+     *
+     * Inside the latch there is no corridor to be careful about: our lines are
+     * not painted here, so every cue that would normally meter the throttle is
+     * describing a road that does not exist for the next half metre. The car is
+     * already driving on a held angle and a bounded distance, and both of those
+     * were committed to on a road three cues agreed was straight. Carrying a
+     * lift through as well buys nothing - there is nothing left for it to buy
+     * safety from - and costs the 348 ms the motor takes to give the speed back.
+     */
+    v = SPEED_MAX;
+#endif
+
+    if (v < SPEED_MIN)
+    {
+        v = SPEED_MIN;
+    }
+    return clampf(v * XSEC_SPEED_FRAC, 0.0f, 100.0f);
+}
+
 static float cornerness_of(const TrackModel *m)
 {
     float a = ramp01(m->headFar, CORNER_HEAD_IGNORE, CORNER_HEAD_FULL);
@@ -94,6 +141,8 @@ void Driver_Init(void)
     Track_Init();
     RL_Init();
     SpeedCtl_Init();
+    Xsec_Init();
+    Recover_Init();
 
     s_steer      = 0.0f;
     s_steerTgt   = 0.0f;
@@ -102,6 +151,7 @@ void Driver_Init(void)
     s_vTarget    = 0.0f;
     s_speedCmd   = 0.0f;
     s_speedFrac  = 0.0f;
+    s_chordFrames = 0u;
     s_sinceFrame  = 0.0f;
     s_blindMs     = 0.0f;
     s_blindM      = 0.0f;
@@ -109,6 +159,10 @@ void Driver_Init(void)
     s_frameDtBest = 0.020f;
     s_brakeMs     = 0.0f;
     s_brakeMag    = 0.0f;
+    s_xsecM       = 0.0f;
+    s_steerHold   = 0.0f;
+    s_headHold    = 0.0f;
+    s_xsecV       = 0.0f;
 
     s_st.severity   = 0.0f;
     s_st.steerTgt   = 0.0f;
@@ -134,6 +188,12 @@ void Driver_Init(void)
     s_st.line.bias    = 0.0f;
     s_st.line.chicane = false;
     s_st.line.clamped = false;
+    s_st.line.probe   = 0.0f;
+
+    /* Seed the caller-visible copy. Safe only now the track model above has
+     * been cleared, since the detector reads it. */
+    Xsec_Update((const TrkSegment *)0, 0u, &s_st.track, 0.0f, 0.0f, 0.0f, &s_st.xsec);
+    Recover_Update(&s_st.track, false, false, &s_st.rcv);
 }
 
 const DriveState *Driver_State(void)
@@ -265,6 +325,21 @@ static void plan_steering(float dtFrame)
     /* Left and right are not mechanically identical on this car. */
     steer *= (steer >= 0.0f) ? STEER_GAIN_RIGHT : STEER_GAIN_LEFT;
 
+    /*
+     * Driving through a recognised crossing.
+     *
+     * Our own two lines are missing here and what is left in the frame is the
+     * crossing track, so everything computed above is being computed from the
+     * wrong road. Hold the angle the car came in on instead. On a square
+     * crossing that is straight ahead; on a crossing laid on a bend it is the
+     * radius the car was already turning, which is exactly what should be
+     * carried across a gap this short.
+     */
+    if (Xsec_Holding(&s_st.xsec))
+    {
+        steer = s_st.xsec.steerOut;
+    }
+
     s_steerTgt    = clampf(steer, STEER_LIMIT_LEFT, STEER_LIMIT_RIGHT);
     s_st.steerTgt = s_steerTgt;
 }
@@ -292,6 +367,18 @@ static void plan_speed(void)
 {
     const TrackModel *m = &s_st.track;
     float             hf, cv, st, sev, v;
+
+    if (s_st.line.chorded)
+    {
+        if (s_chordFrames < 255u)
+        {
+            s_chordFrames++;
+        }
+    }
+    else
+    {
+        s_chordFrames = 0u;
+    }
 
     /* Same "is this really a corner" test the steering uses, so the car never throws
      * away speed for a bend it has already decided to drive straight through. */
@@ -324,20 +411,94 @@ static void plan_speed(void)
 
     v = SPEED_MAX - ((SPEED_MAX - SPEED_MIN) * sev);
 
-    /* Never drive faster than the distance that can actually be seen. */
-    v *= see_factor(m->nValid);
-
-    /* One edge visible means the other one is a guess. Guesses get less speed. */
-    if (!m->bothEdges)
+    /*
+     * Inside a recognised crossing there is no useful corridor at all - our own
+     * lines are simply not painted here - so the whole plan above is describing
+     * the wrong road and the held one replaces it outright.
+     */
+    if (Xsec_Holding(&s_st.xsec))
     {
-        v *= SPEED_ONE_EDGE_CAP;
+        s_vTarget    = xsec_hold_speed();
+        s_st.exiting = true;
+        return;
     }
 
-    /* The safety check had to pull the aim point back, so the corridor is tighter
-     * than the racing line wanted. Take a little more out. */
-    if (s_st.line.clamped)
+    /*
+     * Approaching one is different, and the difference matters. The corner cue
+     * computed above keeps its vote: a bend is still a bend whether or not a
+     * junction happens to sit in it, and suppressing that for the whole second
+     * it takes to arrive would carry the car into the bend with the power still
+     * on. What is stood down is only the three cues a crossing actually
+     * corrupts - the corridor is short because our lines stop at the junction
+     * rather than because the car cannot see, and one edge is missing because
+     * the other is under the crossing track rather than because it was lost.
+     */
+    if (!Xsec_KeepPower(&s_st.xsec) || (sev > XSEC_KEEP_POWER_SEV))
     {
-        v *= 0.90f;
+        /* Never drive faster than the distance that can actually be seen. */
+        v *= see_factor(m->nValid);
+
+        /* One edge visible means the other is a guess. Guesses get less speed. */
+        if (!m->bothEdges)
+        {
+            v *= SPEED_ONE_EDGE_CAP;
+        }
+
+        /* The safety check had to pull the aim point back, so the corridor is
+         * tighter than the racing line wanted. Take a little more out. */
+        if (s_st.line.clamped)
+        {
+            v *= 0.90f;
+        }
+    }
+#if XSEC_FULL_POWER
+    else
+    {
+        /*
+         * A crossing recognised ahead, and the corner cue quiet.
+         *
+         * The branch above has just been skipped because the three cues it
+         * applies are the three a junction corrupts, so what is left in v is the
+         * corner plan alone - and the corner plan has already been asked, in the
+         * condition on that branch, whether there is a bend coming. It said no.
+         * The remaining difference between v and SPEED_MAX is severity the car
+         * has scored for a road that is straight, so the car goes.
+         *
+         * The gate is doing the work, not this line: the moment sev climbs past
+         * XSEC_KEEP_POWER_SEV the whole branch swaps over, the ordinary rules
+         * come back with the final say, and the junction waits its turn.
+         */
+        v = SPEED_MAX;
+    }
+#endif
+
+    /*
+     * Full power is for a corner the camera actually described.
+     *
+     * Everything the plan above is built on - headFar, curv, the steering command -
+     * comes out of this frame's vectors, so when there are too few of them to carry
+     * curvature the cues do not report a corner at all: a bend merged into one chord
+     * per edge arrives as a straight at an angle, scores no severity, and is driven
+     * at the speed of the straight it is pretending to be. No corner cue can catch
+     * that, because the cues are the thing that has gone blind. track.c's canCurve
+     * can, because it is a statement about the description rather than the road: it
+     * says whether any edge was described by more than one vector, which is what
+     * makes curv a measurement rather than an arithmetic zero.
+     *
+     * This sits outside the crossing test above on purpose. A junction is a reason
+     * for the corridor to be short and one-sided, which is why those three cues are
+     * stood down there; it is not a reason for a bend to arrive with no curvature in
+     * it, and if one does, the power still comes down. It costs a little at a
+     * junction that sits on a bend, which -xsec measures.
+     *
+     * It does not fire on a straight, it does not fire on a corner the camera broke
+     * into enough pieces to measure, and being a ceiling rather than a cut it does
+     * nothing to a corner the cues have already slowed below it. What is left is the
+     * one case it is for: the power of a straight, about to be used on a bend.
+     */
+    if ((s_chordFrames >= (uint8_t)SPEED_CHORD_FRAMES) && (v > SPEED_CHORD_CEIL))
+    {
+        v = SPEED_CHORD_CEIL;
     }
 
     /* A camera that has slowed down gets a car that has slowed down. Every correction
@@ -392,22 +553,100 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
             }
         }
 
-        if (Track_Update(segs, n, &s_st.track))
         {
-            float dtFrame = clampf(s_sinceFrame, 1.0e-4f, 0.2f);
+            bool haveTrack = Track_Update(segs, n, &s_st.track);
 
-            s_st.lostFrames = 0u;
-            RL_Compute(&s_st.track, s_speedFrac, &s_st.line);
-            plan_steering(dtFrame);
-            plan_speed();
-        }
-        else if (s_st.lostFrames < 0xFFFFu)
-        {
-            s_st.lostFrames++;
-        }
-        else
-        {
-            /* counter pinned, nothing more to do */
+            /*
+             * Look for a crossing before anything is planned, and do it whether
+             * or not the track model came back usable. Losing the track IS what
+             * a wide crossing looks like from here, so a detector that only ran
+             * on good frames would go quiet exactly when it is needed.
+             *
+             * The angle handed over is not this frame's, and not last frame's
+             * either. Both are already contaminated by the time the car commits:
+             * the crossing eats the corridor a frame or two before the latch and
+             * the steering reacts to that. s_steerHold is sampled only while the
+             * corridor is still whole - before anything is recognised, and on
+             * the approach for as long as both lines are in view and the model
+             * runs deep. A crossing can be recognised two metres out, and an
+             * angle frozen back there is a second stale by the time the car
+             * commits: whatever the car did in that second, the wheel would
+             * still be where it was before it.
+             *
+             * The near heading goes with it, filtered the same way, so that the
+             * detector can tell an angle that was following a bend from one
+             * that was straightening the car up.
+             */
+            XsecPhase was = s_st.xsec.phase;
+
+            if ((was == XSEC_IDLE) ||
+                ((was == XSEC_AHEAD) && s_st.track.haveTrack && s_st.track.bothEdges &&
+                 (s_st.track.nValid >= (uint8_t)XSEC_HOLD_MIN_ROWS)))
+            {
+                s_steerHold += XSEC_HOLD_ALPHA * (s_steerTgt - s_steerHold);
+                s_headHold += XSEC_HOLD_ALPHA * (s_st.track.headNear - s_headHold);
+            }
+
+            Xsec_Update(segs, n, &s_st.track, s_xsecM, s_steerHold, s_headHold, &s_st.xsec);
+            s_xsecM = 0.0f;
+
+            /* Committing. Freeze the speed the approach had settled on, which
+             * already has the crossing's own effect on the corridor discounted
+             * but still respects a corner the car is heading into. */
+            if ((s_st.xsec.phase == XSEC_CROSSING) && (was != XSEC_CROSSING))
+            {
+                s_xsecV = s_vTarget;
+            }
+
+            /*
+             * Then ask whether the car is driving on one black line and a
+             * guess. Like the crossing detector this runs whether or not the
+             * model came back usable, so its idea of how long the car has been
+             * half blind does not depend on the frames it was fully blind.
+             *
+             * It stands down for anything the crossing detector has an opinion
+             * about. A junction interrupts our lines, which is one of the ways
+             * a corridor ends up one-sided, and there the answer is already
+             * decided: hold the wheel where it was. Two modules steering for
+             * the same missing paint would only fight.
+             */
+            Recover_Update(&s_st.track, (s_st.xsec.phase != XSEC_IDLE),
+                           s_st.line.clamped, &s_st.rcv);
+
+            if (haveTrack)
+            {
+                float dtFrame = clampf(s_sinceFrame, 1.0e-4f, 0.2f);
+
+                s_st.lostFrames = 0u;
+                RL_Compute(&s_st.track, s_speedFrac, &s_st.rcv, &s_st.line);
+                plan_steering(dtFrame);
+                plan_speed();
+            }
+            else if (Xsec_Holding(&s_st.xsec))
+            {
+                /* Mid-crossing. The corridor is gone because the paint is gone,
+                 * which is not the same as being lost, so the failsafe counter
+                 * is left alone and the held plan is simply re-asserted.
+                 *
+                 * The steering filter is deliberately not run: there is no real
+                 * aim point this frame, and feeding it the leftovers would leave
+                 * the damping term primed with nonsense for the frame the car
+                 * comes out the other side. */
+                s_steerTgt      = clampf(s_st.xsec.steerOut, STEER_LIMIT_LEFT,
+                                         STEER_LIMIT_RIGHT);
+                s_st.steerTgt   = s_steerTgt;
+                s_vTarget       = xsec_hold_speed();
+                s_st.exiting    = true;
+                s_st.lostFrames = 0u;
+            }
+            else if (s_st.lostFrames < 0xFFFFu)
+            {
+                s_st.lostFrames++;
+            }
+            else
+            {
+                /* counter pinned, nothing more to do */
+            }
         }
 
         s_sinceFrame = 0.0f;
@@ -454,21 +693,42 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
      * the car parks itself in the middle of a dropout it could have driven
      * through. Metres do not have that problem.
      */
-    if (s_st.lostFrames > 0u)
     {
 #if SPEED_CLOSED_LOOP
-        s_blindM += SpeedCtl_State()->vEstMs * dt;
+        float vNow = SpeedCtl_State()->vEstMs;
 #else
         /* The open-loop path never runs the observer, so read the speed straight
          * off the static map instead. It ignores the motor lag and so runs a
          * little ahead of the truth, which errs toward stopping sooner. */
-        s_blindM += SpeedCtl_SpeedForDuty(s_speedCmd) * dt;
+        float vNow = SpeedCtl_SpeedForDuty(s_speedCmd);
 #endif
+        /* Ground covered since the last camera frame, which is what the crossing
+         * detector measures its own patience in. */
+        s_xsecM += vNow * dt;
+
+        if (s_st.lostFrames > 0u)
+        {
+            s_blindM += vNow * dt;
+        }
+        else
+        {
+            s_blindM = 0.0f;
+        }
     }
-    else
+
+    /*
+     * Driving through a recognised crossing is not the same as having lost the
+     * track, even though it looks identical from here: the lines really are
+     * absent, and they are absent for a known and short distance. The detector
+     * caps that distance itself, so the failsafe below is stood down rather than
+     * being allowed to slow and then stop the car in the middle of a junction.
+     */
+    if (Xsec_Holding(&s_st.xsec))
     {
         s_blindM = 0.0f;
     }
+    /* s_blindMs is deliberately left running. It measures frames not arriving at
+     * all, which is a dead camera or a dead bus - still fatal in a junction. */
 
     if (running)
     {
@@ -625,6 +885,19 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
          * moment the car most needs it. */
         diff = 0.5f * DIFF_GAIN * (fabsf(s_steer) / 100.0f);
         diff = clampf(diff, 0.0f, 0.45f);
+    }
+
+    /* What "braking" means under SPEED_CLOSED_LOOP.
+     *
+     * The reverse-pulse block above is compiled out whenever SPEED_CLOSED_LOOP is
+     * set, so s_brakeMs never goes positive and this flag - and TLM_F_BRAKING with
+     * it - could never be set at all. speed_ctl brakes by inverting the motor pole
+     * instead, which shows up as a negative duty in base. Test that directly, and
+     * before the differential and any MOTOR*_INVERT, so the meaning does not depend
+     * on wiring config. */
+    if (base < 0.0f)
+    {
+        cmd->braking = true;
     }
 
     outer = base * (1.0f + diff);

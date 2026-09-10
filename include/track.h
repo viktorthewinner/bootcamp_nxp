@@ -45,6 +45,11 @@ typedef struct
     uint8_t topRow;    /* highest usable row index                        */
     bool    haveTrack; /* enough of a corridor to drive on                */
     bool    bothEdges; /* both black lines were genuinely seen somewhere  */
+    /* One edge was described by more than one vector, so the corridor bends
+     * within this frame and curv below is a measurement. False means every edge
+     * came from a single vector: the corridor is straight by construction and
+     * curv is exactly zero however hard the real road is bending. */
+    bool    canCurve;
 
     /* Heading, in pixels of sideways travel per row of distance ahead.
      * Positive means the track bends to the right. */

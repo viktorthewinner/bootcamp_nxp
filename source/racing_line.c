@@ -42,19 +42,25 @@ void RL_Init(void)
     s_bias = 0.0f;
 }
 
-void RL_Compute(const TrackModel *m, float speedFrac, RacingLine *out)
+void RL_Compute(const TrackModel *m, float speedFrac, const RecoverState *rcv,
+                RacingLine *out)
 {
-    uint8_t la;
+    uint8_t la, segsNeeded;
     float   hn, hf, a, b, turn;
     float   bias, target, half, usable, conf;
+    bool    straight;
     float   lo, hi, yNear, span;
     uint8_t j;
 
-    out->chicane = false;
-    out->clamped = false;
-    out->wEntry  = 0.0f;
-    out->wApex   = 0.0f;
-    out->wExit   = 0.0f;
+    out->chicane  = false;
+    out->clamped  = false;
+    out->probe    = 0.0f;
+    out->wEntry   = 0.0f;
+    out->wApex    = 0.0f;
+    out->wExit    = 0.0f;
+    out->conf     = LINE_CONF_MIN;
+    out->straight = false;
+    out->chorded  = false;
 
     if (!m->haveTrack)
     {
@@ -69,17 +75,50 @@ void RL_Compute(const TrackModel *m, float speedFrac, RacingLine *out)
      * accurate at its two ends, but sagging to the inside of the bend everywhere in
      * between, and carrying no curvature at all. Several short vectors describe the
      * same curve properly.
+     *
+     * All of which is an argument about curves. Laid along a straight the chord is
+     * not an approximation of anything - it is the line - so the two vectors a real
+     * Pixy2 hands back from a straight road describe that road completely. On real
+     * hardware that is most of a lap, so how many vectors are needed is asked of the
+     * geometry rather than fixed. See LINE_CONF_SEGS_STRAIGHT for why the test is
+     * written the way it is, and in particular why curv cannot be what it rests on.
      */
-    if (m->segCount >= (uint8_t)LINE_CONF_SEGS_FULL)
+    straight = (fabsf(m->headFar) < LINE_CONF_STRAIGHT_HEAD) &&
+               (fabsf(m->curv) < LINE_CONF_STRAIGHT_CURV) && m->bothEdges &&
+               (m->nValid >= (uint8_t)LINE_CONF_STRAIGHT_ROWS);
+
+    segsNeeded = straight ? (uint8_t)LINE_CONF_SEGS_STRAIGHT
+                          : (uint8_t)LINE_CONF_SEGS_FULL;
+
+    if (m->segCount >= segsNeeded)
     {
         conf = 1.0f;
     }
     else
     {
-        float t = (float)m->segCount / (float)LINE_CONF_SEGS_FULL;
+        float t = (float)m->segCount / (float)segsNeeded;
 
         conf = LINE_CONF_MIN + ((1.0f - LINE_CONF_MIN) * clampf(t, 0.0f, 1.0f));
     }
+
+    out->conf     = conf;
+    out->straight = straight;
+
+    /*
+     * The specific case the speed planner has to be told about, which is narrower
+     * than "confidence is not full". Curvature is a difference between two headings,
+     * so measuring it takes two vectors along the same edge - three points. One
+     * vector per edge gives two points and a slope, and a slope is a straight: curv
+     * comes out exactly zero no matter how hard the road is bending. A corner
+     * described like that does not read as a mild corner, it reads as no corner, and
+     * every cue built on curvature agrees with it.
+     *
+     * A corner with a bend measured anywhere in it is a corner the cues can see, and
+     * it is left alone - taxing it would cost the lap everywhere and buy nothing.
+     * Note this is not a count: two vectors along one edge measure a bend, while two
+     * vectors one per edge do not, and only track.c knows which of those it had.
+     */
+    out->chorded = (!straight) && (!m->canCurve);
 
     /* ---------------------------------------------------------------
      * 1. How far ahead to aim.
@@ -150,6 +189,19 @@ void RL_Compute(const TrackModel *m, float speedFrac, RacingLine *out)
      * scaled back by the same confidence. */
     bias *= conf;
 
+    /*
+     * Probing for a line that left the frame. Everything the bias was built
+     * from - which phase of the corner this is, how hard it bends - came out
+     * of a headFar that is really just the slope of the single edge still in
+     * view. Committing to a racing line on that is leaning on a corner nobody
+     * measured, so it goes while the probe runs. This is the straightening
+     * half of the recovery, and it happens before the lean below.
+     */
+    if (rcv->active)
+    {
+        bias *= 1.0f - clampf(RCV_BIAS_CUT * rcv->nudge, 0.0f, 1.0f);
+    }
+
     s_bias += LINE_BIAS_ALPHA * (bias - s_bias);
     s_bias = clampf(s_bias, -1.0f, 1.0f);
 
@@ -216,6 +268,29 @@ void RL_Compute(const TrackModel *m, float speedFrac, RacingLine *out)
                 /* already aiming into the corner, nothing to hold back */
             }
         }
+    }
+
+    /*
+     * ...and the lean. Easing the aim point toward the side the camera has
+     * lost yaws the car a few degrees that way, and yaw is what brings a line
+     * back into a frame this narrow - the car barely has to move.
+     *
+     * This is the one place the aim point is allowed toward an edge that was
+     * inferred rather than measured, which the guard immediately above spends
+     * its time preventing. The difference is what it is for: the guard stops
+     * the car spending margin on a racing line through a corner it cannot see,
+     * while this spends a much smaller amount of it to get the measurement
+     * back, gives up after RCV_MAX_FRAMES if that does not work, and stops the
+     * instant the line reappears. It also stays underneath the safety check
+     * below, which is what stops it walking the car into the edge it is
+     * guessing at.
+     */
+    if (rcv->active)
+    {
+        float lean = rcv->lean * RCV_NUDGE_FRAC;
+
+        target += lean * usable;
+        out->probe = lean;
     }
 
     /* ---------------------------------------------------------------

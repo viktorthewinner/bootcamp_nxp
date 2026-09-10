@@ -10,6 +10,9 @@
 #   ./build_and_run.sh -chicane     small chicane handling
 #   ./build_and_run.sh -fault       camera failure behaviour
 #   ./build_and_run.sh -sweep       robustness over camera mountings
+#   ./build_and_run.sh -xsec        intersections, each against the same track without one
+#   ./build_and_run.sh -frames      hand-built frames: crossing shapes, and lookalikes
+#   ./build_and_run.sh -xdump       raw camera frames over a crossing
 #   ./build_and_run.sh -v           lap trace
 set -e
 CC=${CC:-gcc}
@@ -21,9 +24,11 @@ $CC -O1 -std=gnu99 -o "$OUT" \
     "$HERE/../source/racing_line.c" \
     "$HERE/../source/driver.c" \
     "$HERE/../source/speed_ctl.c" \
+    "$HERE/../source/intersection.c" \
+    "$HERE/../source/recover.c" \
     -I"$HERE/../include" -DRACE_BENCH_MODE=0 -lm
 if [ $# -eq 0 ]; then
-    "$OUT"; echo; "$OUT" -line; echo; "$OUT" -chicane; echo; "$OUT" -fault; echo; "$OUT" -sweep
+    "$OUT"; echo; "$OUT" -line; echo; "$OUT" -chicane; echo; "$OUT" -frames; echo; "$OUT" -xsec; echo; "$OUT" -fault; echo; "$OUT" -sweep
 else
     "$OUT" "$@"
 fi

@@ -137,6 +137,12 @@ bool Track_Update(const TrkSegment *segs, uint8_t n, TrackModel *out)
     float   mW[TRK_ROWS];
     uint8_t mN = 0u;
 
+    /* Which vector each row took its left and right edge from, 0xFF for none.
+     * Two rows on the same edge naming different vectors is the whole test for
+     * whether this frame can measure curvature - see canCurve at the end. */
+    uint8_t srcL[TRK_ROWS];
+    uint8_t srcR[TRK_ROWS];
+
     /* ---------------------------------------------------------------
      * 1. Clean up the raw segments.
      * Anything close to horizontal is a start line or an intersection bar, not a
@@ -197,7 +203,10 @@ bool Track_Update(const TrkSegment *segs, uint8_t n, TrackModel *out)
         float lenL   = 0.0f, lenR = 0.0f;
         bool  hasL   = false, hasR = false;
         float wModel = s_widthModel[i];
+        uint8_t jL   = 0xFFu, jR = 0xFFu;
 
+        srcL[i]       = 0xFFu;
+        srcR[i]       = 0xFFu;
         out->y[i]     = y;
         out->sawL[i]  = false;
         out->sawR[i]  = false;
@@ -258,6 +267,7 @@ bool Track_Update(const TrkSegment *segs, uint8_t n, TrackModel *out)
                         bestL = x;
                         lenL  = v[j].len;
                         hasL  = true;
+                        jL    = j;
                     }
                 }
                 else
@@ -267,6 +277,7 @@ bool Track_Update(const TrkSegment *segs, uint8_t n, TrackModel *out)
                         bestR = x;
                         lenR  = v[j].len;
                         hasR  = true;
+                        jR    = j;
                     }
                 }
             }
@@ -350,6 +361,8 @@ bool Track_Update(const TrkSegment *segs, uint8_t n, TrackModel *out)
 
         out->center[i] = 0.5f * (out->xl[i] + out->xr[i]);
         out->valid[i]  = true;
+        srcL[i]        = out->sawL[i] ? jL : 0xFFu;
+        srcR[i]        = out->sawR[i] ? jR : 0xFFu;
         ref            = out->center[i];
     }
 
@@ -483,6 +496,7 @@ bool Track_Update(const TrkSegment *segs, uint8_t n, TrackModel *out)
     out->nValid    = 0u;
     out->topRow    = 0u;
     out->bothEdges = false;
+    out->canCurve  = false;
     for (i = 0u; i < TRK_ROWS; i++)
     {
         if (!out->valid[i])
@@ -516,6 +530,58 @@ bool Track_Update(const TrkSegment *segs, uint8_t n, TrackModel *out)
     for (i = out->nValid; i < TRK_ROWS; i++)
     {
         out->valid[i] = false;
+    }
+
+    /*
+     * Can this frame measure a bend at all?
+     *
+     * curv further down is a far heading minus a near one, and both are read off the
+     * corridor these rows describe. If every row on an edge took its position from
+     * the same single vector then that edge is a straight line by construction, and
+     * so is the heading difference across it - curv comes out zero whatever the real
+     * road is doing. Two rows naming different vectors is the cheapest exact test
+     * that the edge was described by more than one piece, which is the fewest that
+     * can carry a bend.
+     *
+     * Either edge is enough: one line with a bend measured in it is a measurement.
+     */
+    {
+        uint8_t firstL = 0xFFu, firstR = 0xFFu;
+
+        for (i = 0u; i < out->nValid; i++)
+        {
+            if (srcL[i] != 0xFFu)
+            {
+                if (firstL == 0xFFu)
+                {
+                    firstL = srcL[i];
+                }
+                else if (srcL[i] != firstL)
+                {
+                    out->canCurve = true;
+                }
+                else
+                {
+                    /* same vector as the rows below it, still one straight piece */
+                }
+            }
+
+            if (srcR[i] != 0xFFu)
+            {
+                if (firstR == 0xFFu)
+                {
+                    firstR = srcR[i];
+                }
+                else if (srcR[i] != firstR)
+                {
+                    out->canCurve = true;
+                }
+                else
+                {
+                    /* as above */
+                }
+            }
+        }
     }
 
     out->haveTrack = (out->nValid >= 2u);

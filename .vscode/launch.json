@@ -9,7 +9,7 @@
         "elf": "${workspaceFolder}/Debug/nxpcup_official.axf"
       },
       "stopAtSymbol": "main",
-      "probeSerialNumber": "",
+      "probeSerialNumber": "TR4A0QRIEZABI",
       "isAttach": false,
       "skipBuildBeforeDebug": false,
       "gdbInitCommands": [

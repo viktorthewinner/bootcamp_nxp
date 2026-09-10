@@ -22,6 +22,7 @@
 #include "racing_line.h"
 #include "driver.h"
 #include "race_config.h"
+#include "intersection.h"
 
 #define PIXY_MAX_VECTORS 12
 
@@ -49,6 +50,164 @@ static double g_halfW = 22.5;
  * merges smooth curves into a single long straight vector, which chords
  * across the arc - set this to 1 to reproduce that. */
 static int g_maxChunks = 3;
+
+/* ------------------------------------------------------------------ */
+/* Intersections                                                       */
+/*                                                                     */
+/* A crossing is a second piece of track laid over ours. Work in local  */
+/* coordinates at the crossing centre:                                  */
+/*                                                                      */
+/*    u  along our track (forward)                                      */
+/*    v  across it (+v is to the left)                                  */
+/*                                                                      */
+/* Our track occupies |v| <= halfW and its two black lines sit at       */
+/* v = +/-halfW. The crossing track runs along d = (cos a, sin a) and    */
+/* occupies |(u,v).n| <= halfWx, where n = (-sin a, cos a); its own two  */
+/* lines sit on (u,v).n = +/-halfWx.                                     */
+/*                                                                      */
+/* Both tracks are painted on the same floor, so in the overlap the      */
+/* lines are interrupted - ours where the crossing track's surface       */
+/* covers them, theirs where ours does. That is the whole geometry, and  */
+/* it is what the car has to recognise:                                  */
+/*                                                                      */
+/*    our two lines stop, leave a gap, and resume in line with           */
+/*    themselves, and a pair of roughly sideways lines lies across       */
+/*    the gap                                                            */
+/* ------------------------------------------------------------------ */
+#define XSEC_MAX 8
+
+typedef struct
+{
+    double s;      /* arc position of the crossing centre, cm            */
+    double ang;    /* crossing angle to our track, rad (M_PI/2 = square) */
+    double halfW;  /* half width of the crossing track, cm               */
+} Crossing;
+
+static Crossing g_xs[XSEC_MAX];
+static int      g_nxs = 0;
+
+static void xsec_clear(void)
+{
+    g_nxs = 0;
+}
+
+static void xsec_add(double s, double angDeg, double halfW)
+{
+    if (g_nxs >= XSEC_MAX) return;
+    g_xs[g_nxs].s     = s;
+    g_xs[g_nxs].ang   = angDeg * M_PI / 180.0;
+    g_xs[g_nxs].halfW = halfW;
+    g_nxs++;
+}
+
+/* Local (u,v) of a world point about crossing k. */
+static void xsec_local(int k, double px, double py, double *u, double *v)
+{
+    int    i  = (int)(g_xs[k].s / g_step);
+    double th, dx, dy;
+
+    if (i < 0) i = 0;
+    if (i >= g_cn) i = g_cn - 1;
+
+    th = g_cth[i];
+    dx = px - g_cx[i];
+    dy = py - g_cy[i];
+
+    *u = (cos(th) * dx) + (sin(th) * dy);
+    *v = (-sin(th) * dx) + (cos(th) * dy);
+}
+
+/* World point from local (u,v) about crossing k. */
+static void xsec_world(int k, double u, double v, double *px, double *py)
+{
+    int    i = (int)(g_xs[k].s / g_step);
+    double th;
+
+    if (i < 0) i = 0;
+    if (i >= g_cn) i = g_cn - 1;
+
+    th  = g_cth[i];
+    *px = g_cx[i] + (cos(th) * u) - (sin(th) * v);
+    *py = g_cy[i] + (sin(th) * u) + (cos(th) * v);
+}
+
+/* Which crossing paints over one of our own black lines here, or -1. */
+static int xsec_which_hides(double px, double py)
+{
+    int k;
+
+    for (k = 0; k < g_nxs; k++)
+    {
+        double u, v, perp;
+
+        xsec_local(k, px, py, &u, &v);
+        if (fabs(u) > 200.0) continue; /* nowhere near this crossing */
+
+        perp = (-u * sin(g_xs[k].ang)) + (v * cos(g_xs[k].ang));
+        if (fabs(perp) <= g_xs[k].halfW)
+        {
+            return k;
+        }
+    }
+    return -1;
+}
+
+/*
+ * Does the camera follow the corner?
+ *
+ * Where our black line runs into the crossing's black line the two meet and make
+ * one continuous piece of paint. A line tracker following ours does not stop at
+ * the join - it turns and carries on outward along theirs. That is what the real
+ * Pixy2 does, and it is why a crossing arrives as two long vectors splaying
+ * apart rather than as a set of loose horizontal bars.
+ *
+ * Set to 0 to render the two lines as separate pieces instead. Which one a real
+ * camera gives depends on how it segments the frame, so the detector is tested
+ * against both.
+ */
+static int g_xsecMerge = 1;
+
+/* Draw only one of the crossing track's two stubs on each of its lines: -1
+ * keeps the v<0 side, +1 the v>0 side, 0 both. With g_xsecMerge off this
+ * is the frame a real Pixy2 gave at a junction: our line stopping dead at
+ * the corner, the crossing edge leaving that corner on ONE side, and a
+ * plain line on the other - a single elbow, nothing opposite it. */
+static int g_xsecStub = 0;
+
+/*
+ * Where our line at v = side*halfW runs into one of the crossing's two lines,
+ * and which of the two it meets first coming from the car.
+ *
+ * The crossing's lines are the two solutions of (u,v).n = +/-halfWx; ours cuts
+ * each of them at one point, and the corner that matters is the nearer one.
+ */
+static int xsec_corner(int k, double side, double *tCorner, double *cSel, double *dirOut)
+{
+    double a  = g_xs[k].ang;
+    double sA = sin(a), cA = cos(a);
+    double best = 0.0, bestT = 0.0, bestU = 1e18;
+    int    found = 0, i;
+
+    if (fabs(sA) < 0.15) return 0; /* nearly parallel to us - not a crossing */
+
+    for (i = 0; i < 2; i++)
+    {
+        double c = (i == 0) ? g_xs[k].halfW : -g_xs[k].halfW;
+        /* v(t) = t*sA + c*cA = side*g_halfW */
+        double t = ((side * g_halfW) - (c * cA)) / sA;
+        double u = (t * cA) - (c * sA);
+
+        if (u < bestU) { bestU = u; bestT = t; best = c; found = 1; }
+    }
+
+    if (!found) return 0;
+
+    *tCorner = bestT;
+    *cSel    = best;
+    /* Outward means |v| growing on our own side of the track. */
+    *dirOut  = ((side * sA) >= 0.0) ? 1.0 : -1.0;
+    return 1;
+}
 
 static void build_centerline(const TrackSeg *segs, int n)
 {
@@ -125,12 +284,120 @@ static bool project(const Cam *c, double fwd, double lat, double *u, double *v)
  * Renders one track edge into up to 3 segments, the way the Pixy2 breaks a curved
  * line into a small chain of vectors. Points are quantised to integers first.
  */
+static int g_fitChunks = 0;
+#define FIT_TOL 1.0 /* cells a chain may stray from its chord and still be one vector */
+
+/* Chords fitted to the chain: one vector while every point sits within
+ * FIT_TOL of it, otherwise split at the point that strays farthest. */
+static int emit_fit(const double *ux, const double *vy, int a, int b,
+                    TrkSegment *out, int maxOut)
+{
+    double x0 = ux[a], y0 = vy[a], x1 = ux[b], y1 = vy[b];
+    double dx = x1 - x0, dy = y1 - y0, len = sqrt((dx * dx) + (dy * dy));
+    double worst = 0.0;
+    int    wi = -1, i, n1;
+
+    if (maxOut < 1) return 0;
+    if ((b - a) >= 2 && len > 0.5 && maxOut >= 2)
+    {
+        for (i = a + 1; i < b; i++)
+        {
+            double d = fabs(((ux[i] - x0) * dy) - ((vy[i] - y0) * dx)) / len;
+            if (d > worst) { worst = d; wi = i; }
+        }
+    }
+    if (wi < 0 || worst <= FIT_TOL)
+    {
+        out[0].x0 = (float)x0; out[0].y0 = (float)y0;
+        out[0].x1 = (float)x1; out[0].y1 = (float)y1;
+        return 1;
+    }
+    n1 = emit_fit(ux, vy, a, wi, out, maxOut - 1);
+    return n1 + emit_fit(ux, vy, wi, b, out + n1, maxOut - n1);
+}
+
+/* Splits one chain of image points into up to 3 straight vectors. */
+static int emit_chunks(const double *ux, const double *vy, int np,
+                       TrkSegment *out, int maxOut)
+{
+    int chunks, c, nseg = 0;
+
+    if (np < 2 || maxOut < 1) return 0;
+    if (g_fitChunks) return emit_fit(ux, vy, 0, np - 1, out, maxOut);
+
+    chunks = (np >= 12) ? 3 : ((np >= 6) ? 2 : 1);
+    if (chunks > g_maxChunks) chunks = g_maxChunks;
+    /* Fewer, longer chords rather than dropping the far end of the run:
+     * a camera does not discard the part of a line nearest a corner. */
+    if (chunks > maxOut) chunks = maxOut;
+
+    for (c = 0; c < chunks && nseg < maxOut; c++)
+    {
+        int a = (np - 1) * c / chunks;
+        int b = (np - 1) * (c + 1) / chunks;
+        if (b <= a) continue;
+        out[nseg].x0 = (float)ux[a];
+        out[nseg].y0 = (float)vy[a];
+        out[nseg].x1 = (float)ux[b];
+        out[nseg].y1 = (float)vy[b];
+        nseg++;
+    }
+    return nseg;
+}
+
+#define MAX_RUNS 6
+
+/*
+ * Carries the point chain round the corner and out along the crossing's own
+ * line, which is what makes the vector splay outward instead of stopping.
+ * Returns the new point count.
+ */
+static int append_flare(const Cam *cam, double px, double py, double pth,
+                        int k, double side, double *ux, double *vy, int np)
+{
+    double tC, c, dir, t;
+    double a, dU, dV, nU, nV;
+
+    if (!xsec_corner(k, side, &tC, &c, &dir)) return np;
+
+    a  = g_xs[k].ang;
+    dU = cos(a); dV = sin(a);
+    nU = -sin(a); nV = cos(a);
+
+    for (t = tC; np < 128; t += dir * 1.0)
+    {
+        double u = (t * dU) + (c * nU);
+        double v = (t * dV) + (c * nV);
+        double wx, wy, dx, dy, fwd, lat, iu, iv;
+
+        if (fabs(v) > 160.0) break;
+        if (fabs(v) < g_halfW) continue; /* still over our own track */
+
+        xsec_world(k, u, v, &wx, &wy);
+        dx = wx - px; dy = wy - py;
+        fwd = (cos(pth) * dx) + (sin(pth) * dy);
+        lat = (-sin(pth) * dx) + (cos(pth) * dy);
+
+        if (fwd < 1.0 || fwd > 250.0) break;
+        if (!project(cam, fwd, lat, &iu, &iv)) break;
+
+        iu = floor(iu + 0.5);
+        iv = floor(iv + 0.5);
+        if (np > 0 && iu == ux[np - 1] && iv == vy[np - 1]) continue;
+        ux[np] = iu; vy[np] = iv; np++;
+    }
+    return np;
+}
+
 static int render_edge(const Cam *cam, double px, double py, double pth, int hint,
                        double side, TrkSegment *out, int maxOut)
 {
     double ux[128], vy[128];
-    int    np = 0, nseg = 0;
+    int    rs[MAX_RUNS], rl[MAX_RUNS];
+    int    nr = 0, np = 0, cur = 0;
+    int    nseg = 0, r, per;
     int    idx;
+    int    flared = 0;
 
     for (idx = hint; idx < g_cn && np < 128; idx += 2)
     {
@@ -144,31 +411,151 @@ static int render_edge(const Cam *cam, double px, double py, double pth, int hin
 
         if (fwd < 1.0) continue;
         if (fwd > 250.0) break;
+
+        /* A crossing track is painted over our line here. Our line stops - but
+         * the crossing's own line starts at exactly that corner, so unless the
+         * camera breaks them apart the vector turns and carries on outward.
+         * That flare is the thing the car recognises. */
+        if (g_nxs > 0)
+        {
+            int kh = xsec_which_hides(ex, ey);
+
+            if (kh >= 0)
+            {
+                if (g_xsecMerge && !flared)
+                {
+                    int before = np;
+
+                    np = append_flare(cam, px, py, pth, kh, side, ux, vy, np);
+                    if (np > before)
+                    {
+                        flared = 1;
+                    }
+                }
+                if (((np - cur) >= 2) && (nr < MAX_RUNS))
+                {
+                    rs[nr] = cur; rl[nr] = np - cur; nr++;
+                }
+                cur = np;
+                continue;
+            }
+        }
+
         if (!project(cam, fwd, lat, &u, &v)) continue;
 
         u = floor(u + 0.5);
         v = floor(v + 0.5);
-        if (np > 0 && u == ux[np - 1] && v == vy[np - 1]) continue;
+        if (np > cur && u == ux[np - 1] && v == vy[np - 1]) continue;
         ux[np] = u; vy[np] = v; np++;
     }
 
-    if (np < 2) return 0;
-
-    /* Split the point chain into up to 3 straight vectors. */
+    if (((np - cur) >= 2) && (nr < MAX_RUNS))
     {
-        int chunks = (np >= 12) ? 3 : ((np >= 6) ? 2 : 1);
-        if (chunks > g_maxChunks) chunks = g_maxChunks;
-        int c;
-        for (c = 0; c < chunks && nseg < maxOut; c++)
+        rs[nr] = cur; rl[nr] = np - cur; nr++;
+    }
+    if (nr == 0) return 0;
+
+    /* Share the vector budget across the runs, so the piece of line beyond a
+     * crossing is still reported - it is the evidence that the track
+     * continues - but the near run is served first and in full. Splitting
+     * the budget evenly gave each run two of its three chords and silently
+     * dropped the third, which for the near run is the part that reaches
+     * the corner: no corner, no elbow, whatever the camera would have
+     * drawn. */
+    {
+        int want[MAX_RUNS], give[MAX_RUNS], left = maxOut;
+
+        for (r = 0; r < nr; r++)
         {
-            int a = (np - 1) * c / chunks;
-            int b = (np - 1) * (c + 1) / chunks;
-            if (b <= a) continue;
-            out[nseg].x0 = (float)ux[a];
-            out[nseg].y0 = (float)vy[a];
-            out[nseg].x1 = (float)ux[b];
-            out[nseg].y1 = (float)vy[b];
-            nseg++;
+            want[r] = (rl[r] >= 12) ? 3 : ((rl[r] >= 6) ? 2 : 1);
+            if (want[r] > g_maxChunks) want[r] = g_maxChunks;
+            give[r] = 0;
+        }
+        for (r = 0; r < nr && left > 0; r++) { give[r] = 1; left--; }
+        for (r = 0; r < nr && left > 0; r++)
+        {
+            while (give[r] < want[r] && left > 0) { give[r]++; left--; }
+        }
+        for (r = 0; r < nr && nseg < maxOut; r++)
+        {
+            if (give[r] > 0)
+                nseg += emit_chunks(&ux[rs[r]], &vy[rs[r]], rl[r], out + nseg, give[r]);
+        }
+    }
+    (void)per;
+    return nseg;
+}
+
+/*
+ * The crossing track's own two black lines. They run across our path, and our
+ * track paints over their middle, so each one reaches the camera as two stubs -
+ * one either side of our corridor.
+ */
+static int render_crossings(const Cam *cam, double px, double py, double pth,
+                            TrkSegment *out, int maxOut)
+{
+    int k, nseg = 0;
+
+    for (k = 0; k < g_nxs && nseg < maxOut; k++)
+    {
+        double a  = g_xs[k].ang;
+        double dU = cos(a), dV = sin(a);  /* along the crossing track */
+        double nU = -sin(a), nV = cos(a); /* across it                */
+        int    sgn, sideSel;
+
+        for (sgn = -1; sgn <= 1 && nseg < maxOut; sgn += 2)
+        {
+            for (sideSel = 0; sideSel < 2 && nseg < maxOut; sideSel++)
+            {
+                double uxa[128], vya[128];
+                int    np = 0, cap;
+                double t;
+
+                /* When the camera follows the corner, this stub has already
+                 * been drawn as the outward half of our own line's vector.
+                 * Drawing it again would put two vectors on one piece of paint. */
+                if (g_xsecMerge)
+                {
+                    double tC, cS, dr;
+                    double sd = (sideSel == 1) ? 1.0 : -1.0;
+
+                    if (xsec_corner(k, sd, &tC, &cS, &dr) &&
+                        (fabs(cS - ((double)sgn * g_xs[k].halfW)) < 1e-6))
+                    {
+                        continue;
+                    }
+                }
+
+                for (t = -160.0; t <= 160.0; t += 1.0)
+                {
+                    double u = (t * dU) + ((double)sgn * g_xs[k].halfW * nU);
+                    double v = (t * dV) + ((double)sgn * g_xs[k].halfW * nV);
+                    double wx, wy, dx, dy, fwd, lat, iu, iv;
+
+                    if (fabs(v) <= g_halfW) continue;          /* our track covers it */
+                    if ((sideSel == 0) && (v > 0.0)) continue; /* one stub at a time  */
+                if ((g_xsecStub < 0) && (v > 0.0)) continue; /* that stub not drawn */
+                if ((g_xsecStub > 0) && (v < 0.0)) continue;
+                    if ((sideSel == 1) && (v < 0.0)) continue;
+
+                    xsec_world(k, u, v, &wx, &wy);
+                    dx = wx - px; dy = wy - py;
+                    fwd = (cos(pth) * dx) + (sin(pth) * dy);
+                    lat = (-sin(pth) * dx) + (cos(pth) * dy);
+
+                    if (fwd < 1.0 || fwd > 250.0) continue;
+                    if (!project(cam, fwd, lat, &iu, &iv)) continue;
+
+                    iu = floor(iu + 0.5);
+                    iv = floor(iv + 0.5);
+                    if (np > 0 && iu == uxa[np - 1] && iv == vya[np - 1]) continue;
+                    if (np < 128) { uxa[np] = iu; vya[np] = iv; np++; }
+                }
+
+                cap = maxOut - nseg;
+                if (cap > 2) cap = 2;
+                nseg += emit_chunks(uxa, vya, np, out + nseg, cap);
+            }
         }
     }
     return nseg;
@@ -368,6 +755,14 @@ typedef struct
     double dist;
     int    steps;
     int    oneEdgeFrames;
+    int    oeRunMax;        /* longest unbroken one-sided run, frames  */
+    double oeMinClearMiss;  /* closest to the UNSEEN line while blind  */
+    double oeDriftSum;      /* |lat| accumulated over one-sided frames */
+    int    oeDriftN;
+    int    pbFrames;        /* frames with the recovery probe leaning  */
+    double pbMinClear;      /* worst clearance while it was leaning    */
+    int    pbStarted;
+    int    pbFound;
     int    lostFrames;
     int    chicaneFrames;
     int    finished;
@@ -382,6 +777,12 @@ typedef struct
 } Result;
 
 /* Centre line index window for the focused chicane measurement. */
+/* A yaw step injected once, when the car passes g_kickAt cm along the track:
+ * the car arriving at a junction still correcting for something - a bump, a
+ * skid, the tail of a bend. Degrees, + = to the left. */
+static double g_kickAt  = -1.0;
+static double g_kickDeg = 0.0;
+static int    g_kicked  = 0;
 static double g_dropRate = 0.0;   /* fraction of camera frames lost      */
 static double g_blindFrom = -1.0; /* window where the camera sees nothing */
 static double g_blindTo = -1.0;
@@ -403,6 +804,44 @@ static int    g_profLo = -1, g_profHi = -1;
 
 static int g_winLo = -1;
 static int g_winHi = -1;
+
+/*
+ * One-sided vision diagnostics.
+ *
+ * When only one black line is measured the corridor on the other side is a guess
+ * from the width model, so the number that matters is how close the car got to the
+ * line it could NOT see - the one it has no feedback on.
+ */
+static void oe_score(Result *r, const DriveState *st, double lat, double halfW,
+                     double halfCar, int *run)
+{
+    int sawL = 0, sawR = 0, i;
+    double clr;
+
+    if (!st->track.haveTrack || st->track.bothEdges)
+    {
+        *run = 0;
+        return;
+    }
+
+    for (i = 0; i < (int)st->track.nValid; i++)
+    {
+        if (st->track.sawL[i]) sawL = 1;
+        if (st->track.sawR[i]) sawR = 1;
+    }
+    if (sawL == sawR) { *run = 0; return; }
+
+    (*run)++;
+    if (*run > r->oeRunMax) r->oeRunMax = *run;
+
+    /* +lat is toward the LEFT line. */
+    clr = sawL ? (halfW + lat - halfCar)   /* the right line is the unseen one */
+               : (halfW - lat - halfCar);
+    if (clr < r->oeMinClearMiss) r->oeMinClearMiss = clr;
+
+    r->oeDriftSum += fabs(lat);
+    r->oeDriftN++;
+}
 
 static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
                   double startLat, const char *name, int verbose, double maxTime)
@@ -427,11 +866,14 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
     int    hw = 0;
     int    hLag = (int)((SIM_SENSE_DELAY_S / dt) + 0.5);
     int    hFilled = 0;
+    int    oeRun = 0;
 
 
     memset(&r, 0, sizeof(r));
     r.name = name;
     r.minClear = 1e9;
+    r.oeMinClearMiss = 1e9;
+    r.pbMinClear = 1e9;
     r.minSpeed = 1e9;
     r.minSpeedWin = 1e9;
     r.minSpeedWin = 1e9;
@@ -446,6 +888,7 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
     car.halfCar = 7.0;
 
     Driver_Init();
+    g_kicked = 0;
 
     while (t < maxTime)
     {
@@ -456,6 +899,12 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
 
         idx  = nearest_idx(car.x, car.y, hint);
         hint = idx;
+
+        if ((g_kickAt >= 0.0) && !g_kicked && (idx >= (int)(g_kickAt / g_step)))
+        {
+            car.th += g_kickDeg * M_PI / 180.0;
+            g_kicked = 1;
+        }
 
         /* Record where the car is now, and pick out where it was one sensor
          * delay ago - that is the pose the next camera frame describes. */
@@ -484,9 +933,14 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
             frameDiv = 0;
             k = render_edge(cam, sx, sy, sth, sidx, +1.0, allSegs, 4);
             n = (uint8_t)k;
-            k = render_edge(cam, sx, sy, sth, sidx, -1.0, allSegs + n,
-                            PIXY_MAX_VECTORS - n);
+            k = render_edge(cam, sx, sy, sth, sidx, -1.0, allSegs + n, 4);
             n = (uint8_t)(n + k);
+            if (g_nxs > 0)
+            {
+                k = render_crossings(cam, sx, sy, sth, allSegs + n,
+                                     PIXY_MAX_VECTORS - n);
+                n = (uint8_t)(n + k);
+            }
             fresh = true;
 
             /* fault injection */
@@ -510,6 +964,16 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
             if (!st->track.haveTrack) r.lostFrames++;
             else if (!st->track.bothEdges) r.oneEdgeFrames++;
             if (st->line.chicane) r.chicaneFrames++;
+            oe_score(&r, st, lateral_offset(car.x, car.y, idx), halfW,
+                     car.halfCar, &oeRun);
+            if (st->rcv.active)
+            {
+                double c = halfW - fabs(lateral_offset(car.x, car.y, idx)) - car.halfCar;
+                r.pbFrames++;
+                if (c < r.pbMinClear) r.pbMinClear = c;
+            }
+            r.pbStarted = (int)st->rcv.probes;
+            r.pbFound   = (int)st->rcv.found;
         }
 
         /* --- vehicle --- */
@@ -583,7 +1047,7 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
         {
             const DriveState *st = Driver_State();
             int q;
-            printf("-- t=%.3f pose lat=%+.2f  segs=%d\n", t, lat, (int)n);
+            printf("-- t=%.3f s=%.0fcm pose lat=%+.2f  segs=%d\n", t, idx * g_step, lat, (int)n);
             for (q = 0; q < (int)n; q++)
                 printf("     seg%d (%.0f,%.0f)->(%.0f,%.0f)\n", q,
                        allSegs[q].x0, allSegs[q].y0, allSegs[q].x1, allSegs[q].y1);
@@ -592,19 +1056,29 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
                        q, st->track.y[q], st->track.valid[q], st->track.xl[q],
                        st->track.xr[q], st->track.center[q], st->track.width[q],
                        st->track.sawL[q], st->track.sawR[q]);
-            printf("     hN=%+.3f hF=%+.3f nValid=%d tgt=%.1f la=%d steer=%.1f\n",
+            printf("     hN=%+.3f hF=%+.3f nValid=%d tgt=%.1f la=%d steer=%.1f"
+                   " segCount=%d conf=%.2f%s%s\n",
                    st->track.headNear, st->track.headFar, st->track.nValid,
-                   st->line.targetX, st->line.laRow, cmd.steer);
+                   st->line.targetX, st->line.laRow, cmd.steer,
+                   st->track.segCount, st->line.conf,
+                   st->line.straight ? " STRAIGHT" : "",
+                   st->line.chorded ? " CHORDED" : "");
         }
 
         if (verbose && (r.steps % 25 == 0))
         {
+            static const char *ph[] = { "-", "AHEAD", "CROSS", "clear" };
             const DriveState *st = Driver_State();
             printf("  t=%5.2f lat=%+6.2f clr=%+5.2f v=%5.1f steer=%+6.1f "
-                   "hN=%+5.2f hF=%+5.2f rows=%d bias=%+.2f%s%s\n",
+                   "hN=%+5.2f hF=%+5.2f rows=%d sev=%.2f "
+                   "x=%-5s bars=%d y=%4.1f cov=%4.2f gap=%4.2f div=%4.2f%s%s%s%s\n",
                    t, lat, clear, car.v, cmd.steer,
                    st->track.headNear, st->track.headFar, st->track.nValid,
-                   st->line.bias,
+                   st->severity,
+                   ph[(int)st->xsec.phase], st->xsec.bars, st->xsec.barY,
+                   st->xsec.cover, st->xsec.gap, st->xsec.diverge,
+                   st->xsec.bothSides ? " LR" : "",
+                   st->xsec.spanning ? " SPAN" : "",
                    st->line.chicane ? " CHI" : "",
                    cmd.braking ? " BRK" : "");
         }
@@ -659,8 +1133,14 @@ static void report(const Result *r)
            r->avgSpeed, r->maxSpeed);
     printf("%-26s minClearance=%+6.2f cm   excursions=%d (worst %.2f cm over)\n",
            "", r->minClear, r->excursions, r->worstOver);
-    printf("%-26s oneEdge=%d  lost=%d  chicaneFrames=%d\n\n",
-           "", r->oneEdgeFrames, r->lostFrames, r->chicaneFrames);
+    printf("%-26s oneEdge=%d (run<=%d)  lost=%d  chicaneFrames=%d\n",
+           "", r->oneEdgeFrames, r->oeRunMax, r->lostFrames, r->chicaneFrames);
+    printf("%-26s blindSideClear=%+.2f cm  mean|lat| while blind=%.2f cm\n",
+           "", (r->oeMinClearMiss > 1e8) ? 0.0 : r->oeMinClearMiss,
+           (r->oeDriftN > 0) ? (r->oeDriftSum / r->oeDriftN) : 0.0);
+    printf("%-26s probes=%d found=%d  leanFrames=%d  clearWhileLeaning=%+.2f cm\n\n",
+           "", r->pbStarted, r->pbFound, r->pbFrames,
+           (r->pbMinClear > 1e8) ? 0.0 : r->pbMinClear);
 }
 
 /*
@@ -697,6 +1177,18 @@ int main(int argc, char **argv)
 {
     Cam cam;
     int verbose = (argc > 1 && strcmp(argv[1], "-v") == 0);
+
+    /* Every mode, not just -chord, can be run at the vector count real hardware
+     * produces: SIM_CHUNKS=1 merges each edge into one chord, 2 splits it once.
+     * The modes that set g_maxChunks themselves still override this. */
+    {
+        const char *e = getenv("SIM_CHUNKS");
+
+        if ((e != NULL) && (atoi(e) > 0))
+        {
+            g_maxChunks = atoi(e);
+        }
+    }
 
     if (argc > 1 && strcmp(argv[1], "-motormap") == 0)
     {
@@ -924,6 +1416,68 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    if (argc > 1 && strcmp(argv[1], "-oneside") == 0)
+    {
+        /*
+         * Driving on one black line and a guess.
+         *
+         * The Pixy2 sees ~60 degrees across, which is narrower than the track is
+         * wide close up, so there are ordinary corners where the outside line
+         * simply leaves the frame sideways and stays out of it. track.c infers
+         * the missing edge from its width model and keeps going, which means the
+         * car is steering off a number nothing is checking - and the further it
+         * drifts, the more certain the one line it CAN see stays.
+         *
+         * The number that matters here is not lap time and not the clearance the
+         * car ended up with. It is blindSideClear: how close it came to the line
+         * it could not see, on the frames it could not see it. That is the one
+         * with no feedback behind it.
+         *
+         * The corners get tighter down the table and the last two also narrow
+         * the view, which is the same thing a camera mounted a little too high
+         * or aimed a little too low does on a real car.
+         */
+        struct { const char *name; double f, h, hz, halfW, R; } k[] = {
+            { "R90 bend, good mount",    68.0, 18.0, -4.0, 22.5, 90.0 },
+            { "R75 bend",                68.0, 18.0, -4.0, 22.5, 75.0 },
+            { "R60 bend",                68.0, 18.0, -4.0, 22.5, 60.0 },
+            { "R60 bend, 55cm track",    68.0, 18.0, -4.0, 27.5, 60.0 },
+            { "R75 bend, narrow view",   80.0, 18.0, -4.0, 22.5, 75.0 },
+            { "R75 bend, aimed low",     68.0, 22.0, -8.0, 22.5, 75.0 },
+        };
+        int i;
+
+        printf("=== one-sided vision: driving on one line and a guess ===\n");
+        printf("RCV_ENABLE=%d.  blindSide is the clearance to the line the car could\n",
+               (int)RCV_ENABLE);
+        printf("NOT see, while it could not see it - the number with no feedback.\n\n");
+        printf("%-26s %-6s %-8s %-9s %-10s %-8s %s\n", "case", "lap", "oneEdge",
+               "run<=", "blindSide", "minClear", "probes");
+        for (i = 0; i < 6; i++)
+        {
+            TrackSeg t[4];
+            Cam    cm;
+            Result r;
+
+            t[0].curv = 0.0;         t[0].len = 200.0;
+            t[1].curv = 1.0 / k[i].R; t[1].len = k[i].R * M_PI;
+            t[2].curv = 0.0;         t[2].len = 150.0;
+            t[3].curv = -1.0 / k[i].R; t[3].len = k[i].R * (M_PI / 2);
+
+            cm.f = k[i].f; cm.h = k[i].h; cm.horiz = k[i].hz;
+            g_rng = 12345u;
+            g_dropRate = 0.0; g_blindFrom = -1.0; g_blindTo = -1.0;
+            r = run(t, 4, &cm, k[i].halfW, 0.0, k[i].name, 0, 40.0);
+            printf("%-26s %-6.2f %-8d %-9d %+-10.2f %+-9.2f %d/%d%s\n",
+                   k[i].name, r.lapTime, r.oneEdgeFrames, r.oeRunMax,
+                   (r.oeMinClearMiss > 1e8) ? 0.0 : r.oeMinClearMiss,
+                   r.minClear, r.pbFound, r.pbStarted,
+                   r.finished ? "" : "   *DNF*");
+        }
+        printf("\nRun this against a -DRCV_ENABLE=0 build; blindSide must not shrink.\n");
+        return 0;
+    }
+
     if (argc > 1 && strcmp(argv[1], "-fault") == 0)
     {
         /* Blind windows are given in cm along the circuit, so the same piece of road
@@ -1007,6 +1561,514 @@ int main(int argc, char **argv)
         }
         g_winLo = -1;
         g_winHi = -1;
+        return 0;
+    }
+
+    /* Raw frames over a crossing, so the signature can be looked at directly
+     * rather than guessed at.  -xdump [from] [to] [angle] */
+    /*
+     * Hand-built camera frames.
+     *
+     * The circuits in here render their own frames from a track and a camera, and
+     * that is the right way to test almost everything - but it cannot produce the
+     * shape a crossing makes at the top of a real Pixy2 frame. At every mounting
+     * this simulator can actually drive with, our own two lines are already jammed
+     * against the sides of the frame close up, so nothing has room to bend or splay
+     * past them; aim far enough ahead to make room and the horizon guard cuts the
+     * model to four rows and the car cannot drive at all.
+     *
+     * So the shapes are typed in instead, off a real PixyMon frame, and the
+     * negatives are typed in beside them. The negatives are the point. Any detector
+     * fires on the frame it was written from; what has to be shown is that the
+     * things which look like a crossing and are not one - a right-angle corner in
+     * our own track, a line broken by a gap in the paint, one elbow with nothing
+     * opposite it - still come back quiet.
+     */
+    if (argc > 1 && strcmp(argv[1], "-frames") == 0)
+    {
+        struct
+        {
+            const char *name;
+            int         want;  /* 1 = must be recognised, 0 = must not be,
+                                * 2 = no test can see it; reported only   */
+            int         nseg;
+            double      s[8][4]; /* x0 y0 x1 y1, grid cells */
+            int         camB;    /* branches the camera reports, 0 = silent */
+            double      camX, camY; /* where it says the junction is        */
+        } cases[] = {
+            /* Measured off the PixyMon frame the user supplied: our two lines
+             * each stop dead at a corner, and the crossing track's near edge
+             * sets off sideways from that exact point, out to both sides. */
+            { "crossing, elbows (the PixyMon frame)", 1, 4,
+              { { 12.0, 51.6, 21.9,  2.4 },   /* left line, running away   */
+                { 21.9,  2.4,  0.7,  7.2 },   /* its arm, out to the left  */
+                { 64.1, 51.6, 57.1,  1.6 },   /* right line                */
+                { 57.1,  1.6, 78.6,  3.8 } } },/* its arm, out to the right */
+
+            /* Same junction, arms dead level - the slope in the frame above is
+             * the lens, not the track, so neither reading may depend on it. */
+            { "crossing, elbows, level arms", 1, 4,
+              { { 12.0, 51.6, 21.9,  2.4 },
+                { 21.9,  2.4,  0.7,  2.4 },
+                { 64.1, 51.6, 57.1,  1.6 },
+                { 57.1,  1.6, 78.6,  1.6 } } },
+
+            /* The second real PixyMon frame: the camera gave exactly three
+             * vectors. Our left line runs up to a sharp corner, the crossing
+             * edge leaves that corner to the left, and the right-hand line is
+             * plain and unbroken. A real junction with only one elbow in it -
+             * and the car yawed some twenty degrees, so the corridor sweeps
+             * 0.6 columns a row. Two readings of the same screenshot, the
+             * second assuming it is cropped on the right. */
+            { "crossing, ONE elbow (2nd PixyMon frame)", 1, 3,
+              { {  0.5, 51.2, 37.2,  7.8 },   /* left line, running away   */
+                { 37.4,  7.6,  7.1,  2.6 },   /* its arm, out to the left  */
+                { 62.3, 51.4, 75.3, 21.4 } } },/* right line, no corner    */
+            { "crossing, ONE elbow (2nd frame, re-read)", 1, 3,
+              { {  0.0, 50.8, 34.1,  7.0 },
+                { 34.1,  7.0,  6.1,  2.2 },
+                { 57.0, 50.6, 69.0, 20.9 } } },
+
+            /* The third real frame, the same junction close up: both our
+             * lines stop at mid-frame and the crossing's far edge shows at
+             * the top left. No elbow at all - the camera did not draw the
+             * near edge - so no test here can fire on it. It is the frame
+             * AFTER the one the car recognised, and carrying the recognition
+             * across it is the XSEC_AHEAD state's job, not a detector's. */
+            { "crossing close up, no elbow (3rd frame)", 2, 3,
+              { { 18.0, 50.8, 14.0, 34.7 },
+                {  9.7,  9.6, 28.3,  5.6 },
+                { 71.7, 49.7, 69.7, 34.7 } } },
+
+            /* Nothing but our own two lines, converging as perspective says
+             * they must. */
+            { "clean straight", 0, 2,
+              { { 12.0, 51.6, 30.0,  2.0 },
+                { 64.1, 51.6, 49.0,  2.0 } } },
+
+            /* A right-angle corner in OUR track, turning left. Both lines end
+             * in a corner and both arms sweep the same way, because they are
+             * two sides of one road. This is the frame the whole test exists to
+             * tell apart from the first one. */
+            { "square corner, ours, turning left", 0, 4,
+              { { 12.0, 51.6, 21.9,  2.4 },
+                { 21.9,  2.4,  0.7,  7.2 },
+                { 64.1, 51.6, 57.1,  1.6 },
+                { 57.1,  1.6, 36.0,  6.0 } } },
+
+            { "square corner, ours, turning right", 0, 4,
+              { { 12.0, 51.6, 21.9,  2.4 },
+                { 21.9,  2.4, 43.0,  7.0 },
+                { 64.1, 51.6, 57.1,  1.6 },
+                { 57.1,  1.6, 78.6,  3.8 } } },
+
+            /* Each line broken in two by a gap in the paint. The pieces share an
+             * endpoint exactly as an elbow does - what they do not do is head
+             * off sideways from it. */
+            { "line broken by a paint gap", 0, 4,
+              { { 12.0, 51.6, 19.0, 12.0 },
+                { 19.0, 12.0, 21.9,  2.4 },
+                { 64.1, 51.6, 59.0, 12.0 },
+                { 59.0, 12.0, 57.1,  1.6 } } },
+
+            /* One elbow and nothing opposite it, with its corner in the top
+             * rows of the frame. A lone corner that close to the top is not
+             * believed whatever else the frame shows (XSEC_ELB_MIN_ROW): the
+             * line it would have to be checked against leaves the frame with
+             * it. The same junction is back a few frames later, lower down. */
+            { "one elbow at the top of the frame (deferred)", 0, 3,
+              { { 12.0, 51.6, 21.9,  2.4 },
+                { 21.9,  2.4,  0.7,  7.2 },
+                { 64.1, 51.6, 57.1,  1.6 } } },
+
+            /* The same frame four rows on: a lone elbow with everything in
+             * view. Accepted on the geometry alone when XSEC_ELB_SINGLE is
+             * on; the expectation follows the flag so this suite is right in
+             * either build. */
+            { "one elbow, right line plain", XSEC_ELB_SINGLE, 3,
+              { { 12.0, 55.6, 21.9,  6.4 },
+                { 21.9,  6.4,  0.7, 11.2 },
+                { 64.1, 55.6, 57.1,  5.6 } } },
+
+            /* The lone elbow again, but now the camera's own detector agrees a
+             * four-branch junction sits on that corner. With XSEC_ELB_SINGLE
+             * off that is the tie-break the geometry cannot make for itself,
+             * and the only thing that separates this from the entry above. */
+            { "one elbow + camera agrees", 1, 3,
+              { { 12.0, 55.6, 21.9,  6.4 },
+                { 21.9,  6.4,  0.7, 11.2 },
+                { 64.1, 55.6, 57.1,  5.6 } }, 4, 21.9, 6.4 },
+
+            /* Camera says junction, but away across the frame from our corner.
+             * A vote for something else is not a vote for this, or the camera
+             * would be a trigger rather than a corroboration - which only
+             * matters when the geometry alone is not trusted. */
+            { "one elbow + camera agrees elsewhere", XSEC_ELB_SINGLE, 3,
+              { { 12.0, 55.6, 21.9,  6.4 },
+                { 21.9,  6.4,  0.7, 11.2 },
+                { 64.1, 55.6, 57.1,  5.6 } }, 4, 70.0, 48.0 },
+
+            /* ...and a junction the camera calls a two-branch bend is not one.
+             * Only decisive when the geometry alone is not trusted. */
+            { "one elbow + camera says only 2 branches", XSEC_ELB_SINGLE, 3,
+              { { 12.0, 55.6, 21.9,  6.4 },
+                { 21.9,  6.4,  0.7, 11.2 },
+                { 64.1, 55.6, 57.1,  5.6 } }, 2, 21.9, 6.4 },
+
+            /* A lone elbow whose far line the camera cut in two, collinear.
+             * Straight is straight however many pieces it comes in. */
+            { "one elbow, right line in two straight pieces", XSEC_ELB_SINGLE, 4,
+              { { 12.0, 55.6, 21.9,  6.4 },
+                { 21.9,  6.4,  0.7, 11.2 },
+                { 64.1, 55.6, 60.0, 26.0 },
+                { 60.0, 26.0, 57.1,  5.6 } } },
+
+            /* THE LOOKALIKES OF A LONE ELBOW, typed off the simulator's own
+             * frames: every one of these fired the single-elbow rule before
+             * the drift, pre-bend and flatness tests existed, and between
+             * them they put the car off the track on four of five circuits.
+             *
+             * The inside edge of a bend, seen from the straight before it.
+             * The inner line turns across the top of the frame exactly like
+             * a crossing edge does; what gives it away is the outer line
+             * turning with it, chord by chord. */
+            { "bend ahead: inside edge turns, outside follows", 0, 6,
+              { {  0.0, 27.0, 19.0, 12.0 },
+                { 19.0, 12.0, 25.0,  1.0 },
+                { 25.0,  1.0,  0.0,  1.0 },
+                { 78.0, 27.0, 64.0, 16.0 },
+                { 64.0, 16.0, 53.0,  7.0 },
+                { 53.0,  7.0, 38.0,  1.0 } } },
+
+            /* Same, with the outer edge's sweep in one short top piece. */
+            { "bend ahead: outside sweeps in a 3-row piece", 0, 6,
+              { {  0.0, 36.0, 21.0, 14.0 },
+                { 21.0, 14.0, 27.0,  2.0 },
+                { 27.0,  2.0,  0.0,  3.0 },
+                { 78.0, 36.0, 59.0, 16.0 },
+                { 59.0, 16.0, 47.0,  4.0 },
+                { 47.0,  4.0, 26.0,  1.0 } } },
+
+            /* The mirror image, a right-hand bend. */
+            { "right bend ahead, mirror of the above", 0, 6,
+              { {  1.0, 33.0, 20.0, 16.0 },
+                { 20.0, 16.0, 33.0,  4.0 },
+                { 33.0,  4.0, 52.0,  1.0 },
+                { 77.0, 38.0, 59.0, 16.0 },
+                { 59.0, 16.0, 53.0,  2.0 },
+                { 53.0,  2.0, 78.0,  2.0 } } },
+
+            /* Already turning: the corridor sweeps left half a column a row
+             * and the inside corner sits at the top. */
+            { "bend under way, inside corner at the top", 0, 6,
+              { {  1.0, 47.0, 21.0, 16.0 },
+                { 21.0, 16.0, 27.0,  1.0 },
+                { 27.0,  1.0,  0.0,  1.0 },
+                { 78.0, 19.0, 64.0, 12.0 },
+                { 64.0, 12.0, 53.0,  6.0 },
+                { 53.0,  6.0, 41.0,  1.0 } } },
+
+            /* Mid-corner: a 75 degree kink between two steep chords of the
+             * inner edge. Square enough to pass the angle test - and its
+             * arm climbs eight rows in five columns, which no crossing edge
+             * can do, because a crossing edge lies across the road. */
+            { "mid-corner kink, arm climbing steeply", 0, 6,
+              { {  0.0, 16.0, 10.0, 10.0 },
+                { 10.0, 10.0, 19.0,  4.0 },
+                { 19.0,  4.0, 31.0,  1.0 },
+                { 77.0, 49.0, 56.0, 22.0 },
+                { 56.0, 22.0, 44.0,  9.0 },
+                { 44.0,  9.0, 49.0,  1.0 } } },
+
+            /* The inside edge curling into its corner with the outside edge
+             * a single plain chord: the one frame where the other edge says
+             * nothing, and the elbow's own line has to give it away. */
+            { "inside edge curls into corner, outside plain", 0, 4,
+              { {  0.0, 27.0, 19.0, 12.0 },
+                { 19.0, 12.0, 25.0,  1.0 },
+                { 25.0,  1.0,  0.0,  1.0 },
+                { 78.0, 27.0, 40.0,  1.0 } } },
+        };
+        int ncase = (int)(sizeof(cases) / sizeof(cases[0]));
+        int ci, k, bad = 0;
+
+        printf("=== hand-built frames: the shapes of a crossing, and its lookalikes ===\n");
+        printf("gate = road straight enough for the bar and splay tests (XSEC_MAX_HEAD),\n");
+        printf("egate = ... for the elbow test (XSEC_ELB_MAX_HEAD)\n");
+        printf("%-46s %5s %5s %6s %6s %6s %4s %7s %6s  %s\n",
+               "frame", "gate", "egate", "hNear", "hFar", "curv", "rows",
+               "square", "seen", "verdict");
+
+        for (ci = 0; ci < ncase; ci++)
+        {
+            TrkSegment seg[8];
+            TrackModel tm;
+            XsecState  xs;
+            int        f;
+
+            for (k = 0; k < cases[ci].nseg; k++)
+            {
+                seg[k].x0 = (float)cases[ci].s[k][0];
+                seg[k].y0 = (float)cases[ci].s[k][1];
+                seg[k].x1 = (float)cases[ci].s[k][2];
+                seg[k].y1 = (float)cases[ci].s[k][3];
+            }
+
+            Track_Init();
+            Xsec_Init();
+            /* Settled on the frame: the corridor width filter needs a moment,
+             * and the confirm counter wants more than one agreeing frame. */
+            for (f = 0; f < 8; f++)
+            {
+                Xsec_CameraHint(cases[ci].camB > 0, (float)cases[ci].camX,
+                                (float)cases[ci].camY, (uint8_t)cases[ci].camB);
+                Track_Update(seg, (uint8_t)cases[ci].nseg, &tm);
+                Xsec_Update(seg, (uint8_t)cases[ci].nseg, &tm, 0.0f, 0.0f, 0.0f, &xs);
+            }
+
+            {
+                int seen = xs.recognised ? 1 : 0;
+                int ok   = (cases[ci].want == 2) ? 1 : (seen == cases[ci].want);
+
+                if (!ok)
+                {
+                    bad++;
+                }
+                /*
+                 * Whether the safety interlock even let the detectors
+                 * speak. A negative case that fails this proves nothing
+                 * about the detector - the frame was thrown out before it
+                 * was ever asked - so for the corner frames to be worth
+                 * anything their gate has to come back open.
+                 */
+                int gate = (tm.haveTrack &&
+                            (fabsf(tm.headFar) <= XSEC_MAX_HEAD) &&
+                            (fabsf(tm.headNear) <= XSEC_MAX_HEAD) &&
+                            (fabsf(tm.curv) <= XSEC_MAX_CURV));
+                int egate = (tm.haveTrack &&
+                             (fabsf(tm.headFar) <= XSEC_ELB_MAX_HEAD) &&
+                             (fabsf(tm.headNear) <= XSEC_ELB_MAX_HEAD) &&
+                             (fabsf(tm.curv) <= XSEC_MAX_CURV));
+
+                printf("%-46s %5s %5s %6.2f %6.2f %6.2f %4u %7.3f %6s  %s\n",
+                       cases[ci].name, gate ? "open" : "shut", egate ? "open" : "shut",
+                       tm.headNear, tm.headFar, tm.curv, tm.nValid, xs.square,
+                       seen ? "yes" : "no",
+                       (cases[ci].want == 2)
+                         ? (seen ? "recognised" : "quiet - reported only, see below")
+                         : ok ? (cases[ci].want ? "recognised, as it must be"
+                                                : "quiet, as it must be")
+                          : (cases[ci].want ? "*** MISSED IT ***"
+                                            : "*** FALSE POSITIVE ***"));
+            }
+        }
+
+        printf("\n%d of %d frames read correctly\n", ncase - bad, ncase);
+        printf("\nThe 3rd PixyMon frame carries no signature any detector can use: the\n");
+        printf("camera drew our two lines stopping at mid-frame and nothing along the\n");
+        printf("crossing near edge. It arrives a few frames after the elbow frame, and\n");
+        printf("the recognition is carried across it by XSEC_AHEAD - which -xsec\n");
+        printf("exercises - not by anything here.\n");
+        return bad ? 1 : 0;
+    }
+
+    if (argc > 1 && strcmp(argv[1], "-xdump") == 0)
+    {
+        TrackSeg t[] = { {0.0, 600.0} };
+        Cam      cm;
+        Result   r;
+
+        cm.f = 68.0;
+        cm.h     = (argc > 5) ? atof(argv[5]) : 18.0;
+        cm.horiz = (argc > 6) ? atof(argv[6]) : -4.0;
+        if (argc > 7) g_xsecMerge = atoi(argv[7]);
+        g_dumpFrom = (argc > 2) ? atof(argv[2]) : 1.0;
+        g_dumpTo   = (argc > 3) ? atof(argv[3]) : 3.0;
+
+        xsec_clear();
+        xsec_add(250.0, (argc > 4) ? atof(argv[4]) : 90.0, 22.5);
+
+        printf("=== straight track, square crossing at 250 cm ===\n");
+        r = run(t, 1, &cm, 22.5, 0.0, "xdump", 0, 6.0);
+        report(&r);
+        xsec_clear();
+        return 0;
+    }
+
+    /* Intersections: recognise them and keep the power on. */
+    if (argc > 1 && strcmp(argv[1], "-xsec") == 0)
+    {
+        struct
+        {
+            const char *name;
+            double      ang;   /* crossing angle, degrees */
+            double      xw;    /* crossing track half width, cm */
+            double      halfW; /* our half width, cm */
+            double      curv;  /* curvature of our track at the crossing */
+            double      h;     /* camera height, cm                     */
+            double      horiz; /* camera horizon row                    */
+            int         merge; /* 1 = camera follows the corner round    */
+            double      kick;  /* yaw step 100 cm before it, degrees     */
+            double      pre;   /* an R=120 bend ending 40 cm before it   */
+            int         stub;  /* 0 = both crossing stubs drawn, -1/+1 = only one */
+            int         fit;   /* 1 = chords fitted to the paint, as a tracker draws */
+        } k[] = {
+            /* Default mounting: 18 cm mast. The near track is wider than the
+             * frame here, so the two lines only appear once they are a good way
+             * off - which leaves the splay test no headroom and puts the whole
+             * job on the bar test. */
+            { "square, 45cm track",   90.0, 22.5, 22.5, 0.0,         18.0, -4.0,  1, 0.0, 0.0, 0, 0 },
+            { "square, 60cm track",   90.0, 30.0, 30.0, 0.0,         18.0, -4.0,  1, 0.0, 0.0, 0, 0 },
+            { "square, narrow cross", 90.0, 17.5, 22.5, 0.0,         18.0, -4.0,  1, 0.0, 0.0, 0, 0 },
+            { "square, wide cross",   90.0, 30.0, 22.5, 0.0,         18.0, -4.0,  1, 0.0, 0.0, 0, 0 },
+            { "60 deg skew",          60.0, 22.5, 22.5, 0.0,         18.0, -4.0,  1, 0.0, 0.0, 0, 0 },
+            { "45 deg skew",          45.0, 22.5, 22.5, 0.0,         18.0, -4.0,  1, 0.0, 0.0, 0, 0 },
+            { "120 deg skew",        120.0, 22.5, 22.5, 0.0,         18.0, -4.0,  1, 0.0, 0.0, 0, 0 },
+            { "on a gentle bend",     90.0, 22.5, 22.5, 1.0 / 220.0, 18.0, -4.0,  1, 0.0, 0.0, 0, 0 },
+            { "on a tighter bend",    90.0, 22.5, 22.5, 1.0 / 120.0, 18.0, -4.0,  1, 0.0, 0.0, 0, 0 },
+            /* Taller mast, in the aim envelope: both lines are inside the frame
+             * with room either side, which is what a crossing needs in order to
+             * be able to look wider than they do. This is the mounting the splay
+             * test is for. */
+            { "tall mast, square",    90.0, 22.5, 22.5, 0.0,         26.0, -10.0, 1, 0.0, 0.0, 0, 0 },
+            { "tall mast, 45 skew",   45.0, 22.5, 22.5, 0.0,         26.0, -10.0, 1, 0.0, 0.0, 0, 0 },
+            { "tall mast, wide cross",90.0, 30.0, 22.5, 0.0,         26.0, -10.0, 1, 0.0, 0.0, 0, 0 },
+            /* Same again with the camera breaking the paint at the corner
+             * instead of following it round, which some frames do. */
+            { "split corner, square",  90.0, 22.5, 22.5, 0.0,        26.0, -10.0, 0, 0.0, 0.0, 0, 0 },
+            { "split corner, 18cm",    90.0, 22.5, 22.5, 0.0,        18.0, -4.0,  0, 0.0, 0.0, 0, 0 },
+            /* The frame a real Pixy2 gave: the paint broken at the corner,
+             * only ONE side of the crossing drawn, and every straight piece
+             * of paint one vector, the way a line tracker draws it. No bars
+             * on both sides, no splay - the lone elbow is the only thing
+             * that can see it. */
+            { "one stub only, left",   90.0, 22.5, 22.5, 0.0,        18.0, -4.0,  0, 0.0, 0.0, -1, 1 },
+            { "one stub only, right",  90.0, 22.5, 22.5, 0.0,        18.0, -4.0,  0, 0.0, 0.0, +1, 1 },
+            { "tall, one stub, left",  90.0, 22.5, 22.5, 0.0,        26.0, -10.0, 0, 0.0, 0.0, -1, 1 },
+            { "tall, one stub, right", 90.0, 22.5, 22.5, 0.0,        26.0, -10.0, 0, 0.0, 0.0, +1, 1 },
+            /* Arriving at the junction still correcting. The held angle is
+             * sampled from a car that is steering to undo a yaw; carried
+             * across the gap unchanged it goes on turning the car after the
+             * yaw is gone. The real frames show exactly this - a corridor
+             * sweeping 0.6 columns a row at a square crossing. */
+            { "square, yawed 5 deg",   90.0, 22.5, 22.5, 0.0,        18.0, -4.0,  1, 5.0, 0.0, 0, 0 },
+            { "square, yawed 8 deg",   90.0, 22.5, 22.5, 0.0,        18.0, -4.0,  1, 8.0, 0.0, 0, 0 },
+            { "square, yawed -8 deg",  90.0, 22.5, 22.5, 0.0,        18.0, -4.0,  1, -8.0, 0.0, 0, 0 },
+            { "tall mast, yawed 8",    90.0, 22.5, 22.5, 0.0,        26.0, -10.0, 1, 8.0, 0.0, 0, 0 },
+            /* The same thing the way a layout produces it: a bend ending
+             * just before the crossing, so the car is still unwinding. */
+            { "square, 40cm after bend",90.0, 22.5, 22.5, 0.0,       18.0, -4.0,  1, 0.0, 70.0, 0, 0 },
+            { "tall, 40cm after bend", 90.0, 22.5, 22.5, 0.0,        26.0, -10.0, 1, 0.0, 70.0, 0, 0 },
+            /* ...and the way the real camera draws that: one elbow. */
+            { "after bend, one stub L",90.0, 22.5, 22.5, 0.0,        18.0, -4.0,  0, 0.0, 70.0, -1, 1 },
+            { "after bend, one stub R",90.0, 22.5, 22.5, 0.0,        18.0, -4.0,  0, 0.0, 70.0, +1, 1 },
+            { "tall, after bend, stub L",90.0, 22.5, 22.5, 0.0,      26.0, -10.0, 0, 0.0, 70.0, -1, 1 },
+        };
+        int i;
+        int pass  = 0;
+        int total = (int)(sizeof(k) / sizeof(k[0]));
+        int one   = (argc > 2) ? atoi(argv[2]) : -1;
+
+        /*
+         * Every case is run twice: once on bare track, once with the crossing
+         * painted on it and nothing else changed. The question is not whether
+         * the car can take this piece of track flat out - some of it bends, and
+         * it should slow for that - but whether the junction costs it anything.
+         * So the bare run is the reference and the crossing run is measured
+         * against it, which is the only comparison that isolates the feature.
+         */
+        printf("=== intersections: does the junction cost anything? ===\n");
+        printf("%-22s %-15s %-15s %-7s %s\n",
+               "crossing", "minspd bare>x", "clearance b>x", "excurs", "verdict");
+
+        for (i = 0; i < total; i++)
+        {
+            TrackSeg t[4];
+            int      nt;
+            Cam      cm;
+            Result   ctrl, r;
+            int      ok;
+
+            /* The crossing sits at 300 cm whatever comes before it. */
+            if (k[i].pre > 0.0)
+            {
+                t[0].curv = 0.0;         t[0].len = 260.0 - k[i].pre - 40.0;
+                t[1].curv = 1.0 / 120.0; t[1].len = k[i].pre;
+                t[2].curv = 0.0;         t[2].len = 40.0;
+                t[3].curv = k[i].curv;   t[3].len = 340.0;
+                nt = 4;
+            }
+            else
+            {
+                t[0].curv = 0.0;       t[0].len = 260.0;
+                t[1].curv = k[i].curv; t[1].len = 340.0;
+                nt = 2;
+            }
+            g_kickAt  = (k[i].kick != 0.0) ? 200.0 : -1.0;
+            g_kickDeg = k[i].kick;
+            g_xsecStub = k[i].stub;
+            g_fitChunks = k[i].fit;
+
+            if ((one >= 0) && (one != i)) continue;
+
+            cm.f = 68.0; cm.h = k[i].h; cm.horiz = k[i].horiz;
+            g_xsecMerge = k[i].merge;
+
+            /* Score the stretch from where the crossing first comes into view
+             * to well clear of it on the far side. */
+            g_winLo = (int)(230.0 / g_step);
+            g_winHi = (int)(370.0 / g_step);
+
+            xsec_clear();
+            if (one >= 0) printf("--- control: no crossing ---\n");
+            ctrl = run(t, nt, &cm, k[i].halfW, 0.0, k[i].name, (one >= 0), 20.0);
+            if (one >= 0) printf("--- with the crossing ---\n");
+
+            xsec_clear();
+            xsec_add(300.0, k[i].ang, k[i].xw);
+            /* -xsec <case> <from> <to>: raw frames over that window of the
+             * crossing run, in seconds. */
+            if ((one >= 0) && (argc > 4))
+            {
+                g_dumpFrom = atof(argv[3]);
+                g_dumpTo   = atof(argv[4]);
+            }
+            r = run(t, nt, &cm, k[i].halfW, 0.0, k[i].name, (one >= 0), 20.0);
+            g_dumpFrom = -1.0;
+            g_dumpTo   = -1.0;
+
+            g_winLo = -1;
+            g_winHi = -1;
+            g_kickAt = -1.0;
+            g_kickDeg = 0.0;
+            g_xsecStub = 0;
+            g_fitChunks = 0;
+            xsec_clear();
+
+            /*
+             * The junction must not put a wheel over a line, must not stop the
+             * car, must not cost it speed, and must not eat the safety margin.
+             *
+             * Margin, not lateral deviation. Using more of the track while
+             * going faster is what a racing line IS - scoring the deviation
+             * itself would mark the car down for driving well, and would push
+             * any tuning built on this test toward the middle of the road.
+             * What must not shrink is the distance left to the black line.
+             */
+            ok = r.finished && (r.excursions == 0) &&
+                 (r.minSpeedWin >= (0.92 * ctrl.minSpeedWin)) &&
+                 (r.minClear >= (ctrl.minClear - 3.0));
+
+            if (ok) pass++;
+            printf("%-22s %6.0f > %-6.0f %6.2f > %-6.2f %-7d %s\n",
+                   k[i].name, ctrl.minSpeedWin, r.minSpeedWin,
+                   ctrl.minClear, r.minClear, r.excursions,
+                   !r.finished          ? "DID NOT FINISH"
+                   : (r.excursions > 0) ? "LEFT THE TRACK"
+                                        : (ok ? "costs nothing"
+                                              : "the junction cost it"));
+        }
+        printf("\n%d of %d crossings cost the car nothing\n", pass, total);
         return 0;
     }
 

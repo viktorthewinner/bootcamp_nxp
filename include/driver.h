@@ -28,6 +28,8 @@
 #include <stdint.h>
 #include "track.h"
 #include "racing_line.h"
+#include "intersection.h"
+#include "recover.h"
 
 typedef struct
 {
@@ -42,6 +44,8 @@ typedef struct
 {
     TrackModel track;
     RacingLine line;
+    XsecState  xsec;      /* crossing detector, see intersection.h */
+    RecoverState rcv;     /* one-sided vision recovery, see recover.h */
     float      severity;  /* 0 straight, 1 slowest corner  */
     float      steerTgt;
     uint16_t   lostFrames;

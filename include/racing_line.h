@@ -27,6 +27,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "track.h"
+#include "recover.h"
 
 typedef struct
 {
@@ -38,12 +39,20 @@ typedef struct
     float   wEntry;   /* phase weights, exposed for tuning and debug             */
     float   wApex;
     float   wExit;
+    float   probe;    /* one-sided recovery lean, -1..+1, 0 when idle  */
+    float   conf;     /* how well this frame described the road, LINE_CONF_MIN..1 */
+    bool    straight; /* the road is straight, so two vectors describe it fully   */
+    bool    chorded;  /* a bend, described by too few vectors to measure a bend   */
 } RacingLine;
 
 void RL_Init(void);
 
 /* speedFrac is 0 at a standstill and 1 at SPEED_MAX; it sets how far ahead the car
  * looks. Slow means look close and be accurate, fast means look far and be smooth. */
-void RL_Compute(const TrackModel *m, float speedFrac, RacingLine *out);
+/* rcv is the one-sided recovery state from recover.c; see recover.h. It may
+ * shift the aim point toward a black line the camera has lost, and that shift
+ * goes in before the safety check below, never after it. */
+void RL_Compute(const TrackModel *m, float speedFrac, const RecoverState *rcv,
+                RacingLine *out);
 
 #endif /* RACING_LINE_H */
