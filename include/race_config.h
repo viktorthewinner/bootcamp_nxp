@@ -419,6 +419,97 @@
 #define ISEC_PARALLEL_TOL          0.30f
 #define ISEC_COLLINEAR_CM          15.0f
 
+/*
+ * The other way a crossing shows itself: the car is already on its doorstep.
+ *
+ * From a distance the far side of the hole is in frame and the test above finds
+ * it. Close up it is not - the far edges are a few pixels tall at the very top of
+ * the picture and the camera often does not report them at all. What is left is
+ * both black lines stopping dead a short way ahead with nothing beyond either of
+ * them, which is a crossing seen from a metre away and is also exactly the frame
+ * in which the car most needs to decide to go straight.
+ *
+ * BOTH lines have to stop, and within ISEC_MOUTH_SKEW_CM of each other. That is
+ * what keeps a corner out: in a corner the inside line leaves the side of the
+ * frame long before the outside one runs out of look-ahead, so the two ends are
+ * nowhere near each other, while a crossing cuts both with the same straight edge.
+ *
+ * Since the far side cannot be measured from here, it is assumed to be
+ * ISEC_BLIND_CROSS_CM away - one track width, which is what a crossing is.
+ *
+ * IT SHIPS OFF, AND IT IS GATED ON THE CAMERA CONSTANTS BEING RIGHT.
+ *
+ * With CAM_HEIGHT_CM and CAM_HORIZON_ROW matching the real mounting it is free:
+ * every circuit, chicane and camera-failure test in test/track_sim.c runs
+ * identically with it on and off, and it picks up crossings the far-side test
+ * cannot see. With those constants wrong it is dangerous, because "both lines stop
+ * and there is white space beyond" is then also what a badly aimed camera reports
+ * in an ordinary corner - and the car drives straight out of it. Measured, across
+ * the 162 mountings of the robustness sweep: a dozen runs that finished no longer
+ * do, one of them inside the recommended mounting envelope.
+ *
+ * So: measure the two camera numbers, check them, and then set this to 1. Not
+ * before. Everything below it is live either way and needs no retuning.
+ */
+#define ISEC_MOUTH_ENABLE          0
+#define ISEC_MOUTH_CM              55.0f
+#define ISEC_MOUTH_SKEW_CM         25.0f
+#define ISEC_BLIND_CROSS_CM        55.0f
+
+/*
+ * Require a black line lying ACROSS the track, at or beyond where the edges
+ * stopped, before the doorstep test is believed.
+ *
+ * This is the one place the crossing bars are used, and it is not for steering -
+ * they are still never followed. It is for evidence. "Both lines stop and there is
+ * white space beyond" is on its own a very weak signature, because it is also what
+ * a camera that simply cannot see very far reports, all the time. Across the 162
+ * mountings in the robustness sweep, leaving this off turns a dozen runs that
+ * finished into runs that drive straight out of a corner. With it on the sweep is
+ * untouched. Leave it on.
+ */
+#define ISEC_MOUTH_NEEDS_BAR       1
+
+/* Shortest sideways run that counts as a line lying across the track, and how far
+ * either side of the expected crossing the bar may sit and still be believed. */
+#define ISEC_MIN_BAR_CM            15.0f
+#define ISEC_BAR_SLACK_CM          25.0f
+
+/* How much of the line has to have been in view before it stops. A two centimetre
+ * fleck that ends is not a line the car was following. */
+#define ISEC_MOUTH_MIN_RUN_CM      10.0f
+
+/*
+ * Accept one line stopping when the other is not in the picture at all.
+ *
+ * A car arriving off centre cannot see its far edge - a 60 degree view does not
+ * reach it until it is most of a metre away - so close to a crossing there really
+ * is only one line to go on, and insisting on two means never recognising the
+ * crossings the car is worst placed for. This is NOT the same as one line stopping
+ * while the other carries on, which is a corner and is refused whatever this is
+ * set to: in a corner the outside line is the one the camera sees best, and it
+ * does not stop. Set to 0 to require both lines every time.
+ *
+ * With only one line there is no second opinion, so the line itself has to look
+ * like a crossing approach - running very nearly parallel to the car, to within
+ * ISEC_MOUTH_STRAIGHT sideways per forward. In a hairpin the one line the camera
+ * can hold onto sweeps away across the frame, and that is what this refuses.
+ *
+ * It ships OFF, because that is not enough. With it on, all four test circuits
+ * stay clean - but across the 162 camera mountings in the robustness sweep it
+ * turns a dozen runs that finished into runs that leave the track, including one
+ * inside the recommended mounting envelope. A hairpin where the outside line is
+ * momentarily out of frame reads as a crossing, and the car drives straight on.
+ *
+ * So the cost of leaving it off is real and known: a crossing arrived at well off
+ * centre, close enough that the far edges are not in frame, is not recognised and
+ * is driven as ordinary track. The cost of turning it on is a car that
+ * occasionally drives straight out of a corner. Only turn it on with a flight
+ * recording that shows crossings actually being missed this way.
+ */
+#define ISEC_MOUTH_ONE_SIDED       0
+#define ISEC_MOUTH_STRAIGHT        0.20f
+
 /* Frames of agreement before the module is allowed to commit. Counts up on a
  * detection and down on a miss, so one dropped frame does not undo it. */
 #define ISEC_CONFIRM_FRAMES        2

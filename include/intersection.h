@@ -36,6 +36,25 @@
  * to be parallel, and to be in line with the near one is what separates a crossing
  * from an edge that has simply run out of frame.
  *
+ * AND THE SAME CROSSING FROM ITS OWN DOORSTEP
+ *
+ * Close up the far pieces are a couple of pixels tall at the very top of the frame
+ * and the camera often does not report them at all. What is left is both lines
+ * stopping dead a short way ahead with nothing beyond either of them - which is a
+ * crossing seen from a metre away, and is also the frame in which the car most
+ * needs to decide to go straight.
+ *
+ * That signature is much weaker, because it is also what a camera that simply
+ * cannot see very far reports in an ordinary corner. Three things hold it up: both
+ * lines have to stop, within ISEC_MOUTH_SKEW_CM of each other, and there has to be
+ * a line lying ACROSS the track at or beyond where they stopped. That last one is
+ * the only use this module makes of the crossing bars, and it is for evidence, not
+ * for steering - they are still never followed.
+ *
+ * Even so it ships off, gated behind ISEC_MOUTH_ENABLE, because all three of those
+ * are measured through the camera calibration and none of them survives getting it
+ * wrong. race_config.h has the numbers.
+ *
  * MEASURED ON THE GROUND, NOT IN THE PICTURE
  *
  * "A gap about one track width long" is a statement about the track, and in the
@@ -55,7 +74,9 @@
  * which is exactly the thing that is not measurable inside a crossing.
  *
  * How far to drive is not a guess either - the gap was measured on the way in, so
- * the latch runs for that distance plus the length of the car.
+ * the latch runs for that distance plus the length of the car. From the doorstep
+ * the far side cannot be measured, so there it is assumed to be one track width
+ * away, which is what a crossing is.
  *
  * Pure arithmetic, no SDK, no hardware, no file scope state - the caller owns the
  * struct - so it can be compiled and exercised on a PC like the rest of the chain.
@@ -87,6 +108,8 @@ typedef struct
     float slope;      /* heading of the visible edges on the ground, sideways per
                        * forward. 0 = the car is parallel to the track,
                        * positive = the track runs off to the left ahead  */
+    bool  atMouth;    /* found by both lines stopping together rather than by
+                       * seeing the far side - the car is on the doorstep    */
     uint8_t nEdges;   /* vectors that ran up the track this frame, for diagnostics */
 
     /* ---- what the car should do ---- */

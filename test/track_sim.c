@@ -61,6 +61,10 @@ static int g_maxChunks = 3;
 static double g_isecAt    = -1.0;
 static double g_isecBar   = 40.0; /* how far the crossing edges reach outward, cm */
 static int    g_isecTrace = 0;    /* print every detection, for tuning            */
+/* Set to 0 to model a camera that does not report the far side of the crossing
+ * at all - which is what a real Pixy2 does once the car is close enough that the
+ * far edges are a couple of pixels tall at the top of the frame. */
+static int    g_isecFarEdge = 1;
 
 static void build_centerline(const TrackSeg *segs, int n)
 {
@@ -202,6 +206,7 @@ static int render_edge(const Cam *cam, double px, double py, double pth, int hin
                 np = 0;
                 past = 1;
             }
+            if (!g_isecFarEdge) break;
             continue;
         }
 
@@ -1246,6 +1251,31 @@ int main(int argc, char **argv)
                 { "only the bars, no edges at all",
                   { { 100.0, 22.5, 100.0, 62.5 }, { 100.0,-22.5, 100.0,-62.5 } },
                   2, 0, 0 },
+
+                /* on the doorstep: both lines stop together, far side not in
+                 * frame, but the mouth of the crossing is lying across the track */
+                { "both stop at 50 cm, bar across",
+                  { { 25.0, 22.5,  50.0, 22.5 }, { 25.0,-22.5,  50.0,-22.5 },
+                    { 50.0, 22.5,  50.0, 62.5 } },
+                  3, ISEC_MOUTH_ENABLE, 0 },
+                { "both stop at 50 cm, nothing across",
+                  { { 25.0, 22.5,  50.0, 22.5 }, { 25.0,-22.5,  50.0,-22.5 } },
+                  2, 0, 0 },
+                { "one line stops, the other carries on",
+                  { { 25.0, 22.5,  50.0, 22.5 }, { 25.0,-22.5, 190.0,-22.5 },
+                    { 50.0, 22.5,  50.0, 62.5 } },
+                  3, 0, 0 },
+                { "lines stop 30 cm apart, so a corner",
+                  { { 15.0, 22.5,  25.0, 22.5 }, { 20.0,-22.5,  55.0,-22.5 },
+                    { 25.0, 22.5,  25.0, 62.5 } },
+                  3, 0, 0 },
+                { "one line stops, other not in frame",
+                  { { 25.0, 22.5,  50.0, 22.5 }, { 50.0, 22.5, 50.0, 62.5 } },
+                  2, ISEC_MOUTH_ENABLE && ISEC_MOUTH_ONE_SIDED,
+                  (ISEC_MOUTH_ENABLE && ISEC_MOUTH_ONE_SIDED) ? -1 : 0 },
+                { "the one line sweeps away, so a bend",
+                  { { 25.0, 22.5,  50.0, 35.0 }, { 50.0, 35.0, 50.0, 75.0 } },
+                  2, 0, 0 },
             };
             int i;
 
@@ -1360,16 +1390,28 @@ int main(int argc, char **argv)
                 {-1.0 / 85.0, 85.0 * M_PI},
                 {0.0, 100.0},
             };
+            static const TrackSeg chicane[] = {
+                {0.0, 250.0},
+                {1.0 / 200.0, 60.0},
+                {-1.0 / 200.0, 120.0},
+                {1.0 / 200.0, 60.0},
+                {0.0, 250.0},
+                {1.0 / 70.0, 70.0 * M_PI},
+                {0.0, 150.0},
+                {-1.0 / 95.0, 95.0 * M_PI},
+                {0.0, 100.0},
+            };
             struct { const char *name; const TrackSeg *t; int n; double hw; double lat; } k[] = {
-                { "mixed circuit, off centre", mixed,  11, 22.5, 12.0 },
-                { "tight 180s",                tight,   5, 22.5,  0.0 },
-                { "oval, R=90cm",              oval,    5, 22.5,  0.0 },
-                { "narrow track (35 cm)",      narrow,  5, 17.5,  0.0 },
+                { "mixed circuit, off centre", mixed,   11, 22.5, 12.0 },
+                { "tight 180s",                tight,    5, 22.5,  0.0 },
+                { "oval, R=90cm",              oval,     5, 22.5,  0.0 },
+                { "narrow track (35 cm)",      narrow,   5, 17.5,  0.0 },
+                { "chicane + sweepers",        chicane,  9, 22.5,  0.0 },
             };
             int i;
 
             g_isecAt = -1.0;
-            for (i = 0; i < 4; i++)
+            for (i = 0; i < 5; i++)
             {
                 Result r = run(k[i].t, k[i].n, &cam, k[i].hw, k[i].lat,
                                k[i].name, 0, 60.0);
@@ -1411,17 +1453,26 @@ int main(int argc, char **argv)
                 {0.0, 300.0},
                 {0.0, 200.0},
             };
-            struct { const char *name; const TrackSeg *t; int n;
-                     double at; double lat; double bar; } k[] = {
-                { "straight, crossing at 300 cm", straight,  3, 300.0,   0.0, 40.0 },
-                { "same, car starts 10 cm left",  straight,  3, 300.0,  10.0, 40.0 },
-                { "same, car starts 10 cm right", straight,  3, 300.0, -10.0, 40.0 },
-                { "short bars, 20 cm stubs",      straight,  3, 300.0,   0.0, 20.0 },
-                { "crossing just after a bend",   afterBend, 4, 420.0,   0.0, 40.0 },
+            struct { const char *name; const TrackSeg *t; int n; double at;
+                     double lat; double bar; int farEdge; int wantCross; } k[] = {
+                { "straight, crossing at 300 cm", straight,  3, 300.0,   0.0, 40.0, 1, 1 },
+                { "same, car starts 10 cm left",  straight,  3, 300.0,  10.0, 40.0, 1, 1 },
+                { "same, car starts 10 cm right", straight,  3, 300.0, -10.0, 40.0, 1, 1 },
+                { "short bars, 20 cm stubs",      straight,  3, 300.0,   0.0, 20.0, 1, 1 },
+                { "crossing just after a bend",   afterBend, 4, 420.0,   0.0, 40.0, 1, 1 },
+                /* The camera never reports the far side, so the only thing left to
+                 * go on is both lines stopping together in front of the car. */
+                { "far side never reported at all", straight, 3, 300.0,  0.0, 40.0, 0,
+                  ISEC_MOUTH_ENABLE },
+                /* ...and off centre the other line is outside a 60 degree view as
+                 * well, so there is only one left. Recognising that needs
+                 * ISEC_MOUTH_ONE_SIDED, which ships off - see race_config.h. */
+                { "far side gone, car 10 cm left", straight, 3, 300.0, 10.0, 40.0, 0,
+                  ISEC_MOUTH_ENABLE && ISEC_MOUTH_ONE_SIDED },
             };
             int i;
 
-            for (i = 0; i < 5; i++)
+            for (i = 0; i < 7; i++)
             {
                 Result r, ctl;
                 int    bad;
@@ -1432,20 +1483,33 @@ int main(int argc, char **argv)
                 g_isecAt = -1.0;
                 ctl = run(k[i].t, k[i].n, &cam, 22.5, k[i].lat, k[i].name, 0, 40.0);
 
-                g_isecAt  = k[i].at;
-                g_isecBar = k[i].bar;
+                g_isecAt     = k[i].at;
+                g_isecBar    = k[i].bar;
+                g_isecFarEdge = k[i].farEdge;
                 r = run(k[i].t, k[i].n, &cam, 22.5, k[i].lat, k[i].name, 0, 40.0);
+                g_isecFarEdge = 1;
 
                 g_winLo = -1;
                 g_winHi = -1;
 
-                bad = (r.isecCross < 1) || (r.excursions > 0) || !r.finished;
+                /* A case that is meant to be crossed has to finish. One that
+                 * is not only has to stay inside the lines - stopping in the
+                 * middle of an unrecognised crossing is the failsafe doing
+                 * its job, not a fault. */
+                bad = ((r.isecCross >= 1) != (k[i].wantCross != 0)) ||
+                      (r.excursions > 0) ||
+                      (k[i].wantCross && !r.finished);
                 if (bad) fails++;
 
                 printf("%-34s %-9d %-8d %-9.0f %-8.1f %-8.1f %s\n", k[i].name,
                        r.isecSeen, r.isecCross, r.isecFirstS,
                        r.peakLatWin, ctl.peakLatWin,
-                       bad ? "*** FAILED ***" : "straight through, inside the lines");
+                       bad ? "*** FAILED ***"
+                           : (k[i].wantCross
+                                  ? "straight through, inside the lines"
+                                  : (r.finished
+                                         ? "not recognised, driven as track"
+                                         : "not recognised, stopped safely")));
             }
             g_isecAt  = -1.0;
             g_isecBar = 40.0;

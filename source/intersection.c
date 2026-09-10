@@ -72,10 +72,13 @@ static float lat_at(const Edge *e, float f)
  * where they get thrown away - the whole method only ever looks at lines that run
  * away from the car, and where they stop.
  */
-static uint8_t collect_edges(const TrkSegment *segs, uint8_t n, Edge *out)
+static uint8_t collect_edges(const TrkSegment *segs, uint8_t n, Edge *out,
+                            float *barFwd, uint8_t *nBar)
 {
     uint8_t i;
     uint8_t k = 0u;
+
+    *nBar = 0u;
 
     const float vMin = CAM_HORIZON_ROW + ISEC_MIN_ROWS_BELOW_HZ;
 
@@ -125,10 +128,21 @@ static uint8_t collect_edges(const TrkSegment *segs, uint8_t n, Edge *out)
         dF = fFar - fNear;
         dL = lFar - lNear;
 
-        /* Runs up the track, not across it. A crossing bar fails here, and so does
-         * anything else lying sideways in the frame. */
+        /* Runs up the track, not across it. */
         if (dF < (ISEC_LONG_RATIO * fabsf(dL)))
         {
+            /*
+             * Lying across it instead. These are never steered by - that is the
+             * whole point of sorting them out here - but where they are is kept,
+             * because a line lying across the track ahead is the one piece of
+             * positive evidence that the white space beyond the edges is a
+             * crossing rather than the end of what the camera can see.
+             */
+            if ((fabsf(dL) > ISEC_MIN_BAR_CM) && (*nBar < ISEC_MAX_EDGES))
+            {
+                barFwd[*nBar] = 0.5f * (fNear + fFar);
+                (*nBar)++;
+            }
             continue;
         }
 
@@ -388,6 +402,204 @@ static bool find_gap(const Edge *e, uint8_t n, bool left,
     return true;
 }
 
+/* ---- step 3: already at the mouth of one ------------------------------- */
+#if ISEC_MOUTH_ENABLE
+
+/*
+ * The other thing a crossing looks like, once the car is nearly on top of one.
+ *
+ * From a distance the far side of the hole is in frame and step 2 finds it. Close
+ * up it is not: the far edges are a few pixels tall at the very top of the picture
+ * and the camera often does not report them at all. What is left is both black
+ * lines stopping dead a short way ahead and nothing beyond either of them - which
+ * is a crossing seen from its own doorstep, and it is also exactly what the driver
+ * of this car sees at the moment it most needs to decide to go straight.
+ *
+ * BOTH sides have to do it, and at the same distance. That is what keeps a corner
+ * out: in a corner the inside line leaves the side of the frame long before the
+ * outside one runs out of look-ahead, so the two ends are nowhere near each other.
+ * A crossing cuts both lines with the same straight edge, so they stop together.
+ *
+ * Returns true and fills endCm with how far ahead the two lines stop.
+ */
+static bool side_dead_end(const int8_t *owner, float *endCm)
+{
+    uint8_t b0, b1, b;
+
+    b0 = 0u;
+    while ((b0 < ISEC_BINS) && (owner[b0] < 0))
+    {
+        b0++;
+    }
+    if ((b0 >= ISEC_BINS) || (((float)b0 * ISEC_BIN_CM) > ISEC_EDGE_START_MAX_CM))
+    {
+        return false; /* nothing on this side, or nothing near the car */
+    }
+
+    b1 = b0;
+    while ((b1 < ISEC_BINS) && (owner[b1] >= 0))
+    {
+        b1++;
+    }
+    if (b1 >= ISEC_BINS)
+    {
+        return false; /* runs to the end of the scan: this line is not stopping */
+    }
+
+    if (((float)b1 * ISEC_BIN_CM) > ISEC_MOUTH_CM)
+    {
+        return false; /* stops, but too far out to be a doorstep */
+    }
+
+    if (((float)(b1 - b0) * ISEC_BIN_CM) < ISEC_MOUTH_MIN_RUN_CM)
+    {
+        return false; /* a stub, not a line the car was following */
+    }
+
+    for (b = b1; b < ISEC_BINS; b++)
+    {
+        if (owner[b] >= 0)
+        {
+            return false; /* something out there, so step 2 owns this frame */
+        }
+    }
+
+    *endCm = (float)b1 * ISEC_BIN_CM;
+    return true;
+}
+
+#if ISEC_MOUTH_ONE_SIDED
+static bool side_empty(const int8_t *owner)
+{
+    uint8_t b;
+
+    for (b = 0u; b < ISEC_BINS; b++)
+    {
+        if (owner[b] >= 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Steepest thing on one side, as a fraction: how far from parallel to the car the
+ * line the camera can see actually runs. */
+static float side_slope(const Edge *e, uint8_t n, bool left)
+{
+    const Edge *best = NULL;
+    uint8_t     i;
+
+    for (i = 0u; i < n; i++)
+    {
+        if (e[i].left != left)
+        {
+            continue;
+        }
+        if ((best == NULL) || (e[i].len > best->len))
+        {
+            best = &e[i];
+        }
+    }
+
+    return (best != NULL) ? fabsf(best->slope) : 1.0e9f;
+}
+#endif /* ISEC_MOUTH_ONE_SIDED */
+
+/*
+ * Is there a black line lying across the track, at or beyond where the edges
+ * stopped? That is the mouth of the crossing, or its far side, and it is the
+ * difference between "the track is cut here" and "this is as far as I can see".
+ */
+static bool bar_across(const float *barFwd, uint8_t nBar, float mouthCm)
+{
+    uint8_t i;
+
+    for (i = 0u; i < nBar; i++)
+    {
+        if ((barFwd[i] > (mouthCm - ISEC_BAR_SLACK_CM)) &&
+            (barFwd[i] < (mouthCm + ISEC_BLIND_CROSS_CM + ISEC_BAR_SLACK_CM)))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool find_mouth(const Edge *e, uint8_t nEdge,
+                       const int8_t *coverL, const int8_t *coverR,
+                       const float *barFwd, uint8_t nBar,
+                       float *mouthCm, bool *left, bool *right)
+{
+    float lEnd = 0.0f, rEnd = 0.0f;
+    bool  l    = side_dead_end(coverL, &lEnd);
+    bool  r    = side_dead_end(coverR, &rEnd);
+
+#if !ISEC_MOUTH_ONE_SIDED
+    (void)e;
+    (void)nEdge;
+#endif
+
+    if (l && r)
+    {
+        if (fabsf(lEnd - rEnd) > ISEC_MOUTH_SKEW_CM)
+        {
+            return false; /* one line gave up well before the other: not one cut */
+        }
+
+        *mouthCm = (lEnd < rEnd) ? lEnd : rEnd;
+
+#if ISEC_MOUTH_NEEDS_BAR
+        if (!bar_across(barFwd, nBar, *mouthCm))
+        {
+            return false;
+        }
+#endif
+        *left  = true;
+        *right = true;
+        return true;
+    }
+
+#if ISEC_MOUTH_ONE_SIDED
+    /*
+     * One line stops and the other is not in the picture at all.
+     *
+     * This is the car arriving off centre: the far edge is outside a 60 degree
+     * view until it is most of a metre away, so close to a crossing there is
+     * genuinely only one line to see, and insisting on two would mean never
+     * recognising a crossing the car is off line for - which is the case it most
+     * needs to get right.
+     *
+     * With only one line there is no second opinion, so the line itself has to
+     * look like a crossing approach: running very nearly parallel to the car. In a
+     * hairpin the one line the camera can hold onto sweeps away across the frame,
+     * and that is what ISEC_MOUTH_STRAIGHT refuses.
+     */
+    if (l && side_empty(coverR) &&
+        (side_slope(e, nEdge, true) <= ISEC_MOUTH_STRAIGHT) &&
+        bar_across(barFwd, nBar, lEnd))
+    {
+        *mouthCm = lEnd;
+        *left    = true;
+        *right   = false;
+        return true;
+    }
+    if (r && side_empty(coverL) &&
+        (side_slope(e, nEdge, false) <= ISEC_MOUTH_STRAIGHT) &&
+        bar_across(barFwd, nBar, rEnd))
+    {
+        *mouthCm = rEnd;
+        *left    = false;
+        *right   = true;
+        return true;
+    }
+#endif
+
+    return false;
+}
+
+#endif /* ISEC_MOUTH_ENABLE */
+
 /* ---- public interface --------------------------------------------------- */
 
 void Intersection_Init(Intersection *st)
@@ -400,6 +612,7 @@ void Intersection_Init(Intersection *st)
     st->gapCm      = 0.0f;
     st->slope      = 0.0f;
     st->nEdges     = 0u;
+    st->atMouth    = false;
     st->steer      = 0.0f;
     st->authority  = 0.0f;
     st->phase      = ISEC_IDLE;
@@ -413,7 +626,8 @@ void Intersection_Init(Intersection *st)
 void Intersection_Update(const TrkSegment *segs, uint8_t n, Intersection *st)
 {
     Edge    edges[ISEC_MAX_EDGES];
-    uint8_t nEdge;
+    float   barFwd[ISEC_MAX_EDGES];
+    uint8_t nEdge, nBar;
     float   lStart = 0.0f, lEnd = 0.0f;
     float   rStart = 0.0f, rEnd = 0.0f;
 
@@ -421,7 +635,7 @@ void Intersection_Update(const TrkSegment *segs, uint8_t n, Intersection *st)
     st->sawLeft  = false;
     st->sawRight = false;
 
-    nEdge      = collect_edges(segs, n, edges);
+    nEdge      = collect_edges(segs, n, edges, barFwd, &nBar);
     st->nEdges = nEdge;
 
     /* ---------------------------------------------------------------
@@ -460,6 +674,39 @@ void Intersection_Update(const TrkSegment *segs, uint8_t n, Intersection *st)
 
         st->sawLeft  = find_gap(edges, nEdge, true, coverL, coverR, &lStart, &lEnd);
         st->sawRight = find_gap(edges, nEdge, false, coverR, coverL, &rStart, &rEnd);
+
+#if ISEC_MOUTH_ENABLE
+        if (!st->sawLeft && !st->sawRight)
+        {
+            float mouth = 0.0f;
+            bool  ml = false, mr = false;
+
+            if (find_mouth(edges, nEdge, coverL, coverR, barFwd, nBar,
+                           &mouth, &ml, &mr))
+            {
+                /* The line stops with nothing beyond. The far side cannot be
+                 * measured from here, so it is assumed to be one track width
+                 * away - which is what a crossing is. */
+                st->sawLeft  = ml;
+                st->sawRight = mr;
+                lStart       = mouth;
+                rStart       = mouth;
+                lEnd         = mouth + ISEC_BLIND_CROSS_CM;
+                rEnd         = lEnd;
+                st->atMouth  = true;
+            }
+            else
+            {
+                st->atMouth = false;
+            }
+        }
+        else
+        {
+            st->atMouth = false;
+        }
+#else
+        st->atMouth = false;
+#endif
     }
 
     if (st->sawLeft || st->sawRight)

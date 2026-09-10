@@ -120,13 +120,30 @@ is measured, and that needs to know where the camera is:
 | `CAM_HEIGHT_CM` | Height of the lens above the track surface. A ruler. |
 
 **Get these right before blaming anything else.** They scale every distance the
-detector measures, so a horizon several rows out will make it miss crossings, and a
-height badly out can make it read something else as one. That is not theoretical:
-in the robustness sweep, the two mountings furthest from these values were the only
-ones where the detector ever fired on a circuit with no crossings on it, and closing
-that took an extra check rather than a threshold change. If you would rather not
-have the feature at all, set `ISEC_ENABLE 0` and the car behaves exactly as it did
-without it.
+detector measures. With them right, everything below is free — every circuit,
+chicane and camera-failure test runs identically with the feature in and out. With
+them wrong, distances come out scaled and the detector starts reading ordinary
+corners as crossings.
+
+That is measured, not theoretical, and it is why one half of the detector ships
+switched off:
+
+| | Ships | Finds | Needs the two numbers above to be |
+|---|---|---|---|
+| **Far-side test** — the edge stops, white space, the same edge picks up again parallel and in line | **on** | a crossing from 1–2 m out | roughly right |
+| **Doorstep test** — both edges stop together, nothing beyond, a bar lying across the track | **off** (`ISEC_MOUTH_ENABLE`) | the same crossing once the car is on top of it and the far side is no longer in frame | right |
+
+The doorstep test is the one that recognises a crossing the car is already sitting
+in. It is also the fragile one: "both lines stop and there is white space beyond"
+is what a badly aimed camera reports in an ordinary corner too. Across the 162
+mountings in the robustness sweep — where the simulated camera deliberately does
+*not* match these constants — turning it on costs a dozen runs that finished,
+including one inside the recommended mounting envelope. With a camera that does
+match, it costs nothing at all.
+
+So: **measure the two numbers, check them, then set `ISEC_MOUTH_ENABLE 1`.** In
+that order. If you would rather not have any of it, `ISEC_ENABLE 0` puts the car
+back exactly as it was.
 
 ### 3. First power-up
 
@@ -234,6 +251,16 @@ unbroken pair of edges. And the *other* edge gets a veto — a crossing cuts bot
 black lines at the same place, so if the line on the far side of the car runs
 straight through the hole, the hole is this edge dropping out while the track
 carries on.
+
+Close up, though, the far pieces are a couple of pixels tall at the top of the
+frame and the camera often stops reporting them, which leaves only both edges
+stopping together with nothing beyond. That is a much weaker signature — it is also
+what a camera that cannot see far reports in a corner — so it is held up by three
+things: both edges must stop, within 25 cm of each other, and there must be a line
+lying *across* the track at or beyond where they stopped. That is the only use made
+of the crossing bars, and it is evidence, not steering. It still ships switched off
+behind `ISEC_MOUTH_ENABLE`, because all three are measured through the camera
+calibration; see *Before the first run*.
 
 Then the car lines itself up **parallel to the track and drives**. Parallel, not
 centred: the visible edges have a heading relative to the car, the steering nulls
@@ -377,9 +404,10 @@ far piece that is not parallel, one that is 40 cm out of line, an edge with noth
 near the car, and a frame containing only the crossing bars are all rejected. The
 last two cases check the steering points the right way.
 
-*False alarms.* Four ordinary circuits with no crossing anywhere on them, ~2000
-camera frames including two hairpins and a 35 cm-wide track. **Not one frame is
-even detected**, let alone committed to.
+*False alarms.* Five ordinary circuits with no crossing anywhere on them, ~2600
+camera frames including two hairpins, a chicane and a 35 cm-wide track. **Not one
+frame is even detected**, let alone committed to — with the doorstep test switched
+on as well as off.
 
 *Driving through one.* The main edges stop for the width of the crossing track and
 pick up again on the far side, with four bars run out of the corners — exactly what
@@ -394,11 +422,19 @@ purpose and without the control there is no telling which put the car where:
 | Same, car starts 10 cm right | 33 | 1 | 6.7 cm / 6.6 cm | straight through |
 | Short 20 cm bar stubs | 31 | 1 | 0.2 cm / 0.6 cm | straight through |
 | Crossing just after a bend | 24 | 1 | 13.8 cm / 13.3 cm | straight through |
+| Far side never reported at all | 0 → 2 | 0 → 1 | — / 0.6 cm | needs `ISEC_MOUTH_ENABLE` |
+| Same, car 10 cm off line | 0 | 0 | — / 6.3 cm | not recognised |
 
-Committed exactly once each, at about 50 cm out, no line contact. The two columns
-are the point: holding heading through the crossing leaves the car within half a
-centimetre of the line it would have been on anyway. The 13.8 cm in the last row is
-the racing line running wide out of the bend, not the crossing.
+Committed exactly once each, at about 50 cm out, no line contact. The two offset
+columns are the point: holding heading through the crossing leaves the car within
+half a centimetre of the line it would have been on anyway. The 13.8 cm in the
+"after a bend" row is the racing line running wide out of the bend, not the
+crossing.
+
+The last two rows are the camera never reporting the far side of the crossing at
+all. The first needs the doorstep test switched on; the second needs it *and*
+`ISEC_MOUTH_ONE_SIDED`, which is off for good reason — see race_config.h. Both
+fail safe: the car drives the crossing as ordinary track, or stops in it.
 
 **Camera failure** — **no line contact in any of these**:
 
@@ -441,10 +477,16 @@ mountings, and that the chicane and racing-line behaviour is real rather than ho
   `CAM_HEIGHT_CM` to be roughly right (see *Before the first run*). It is the only part
   of the firmware that is not calibration-free. On a banked or humped track the
   unprojection is wrong and crossings will be missed.
-- It needs to see the far side of the crossing before it will commit, so a crossing
-  approached with the far edge hidden — over a crest, or with the car so far off line
-  that the far edge is outside the picture — will not be recognised. That fails the
-  right way: the car drives it as ordinary track.
+- As shipped it needs to see the far side of the crossing before it will commit, so
+  a crossing the car is already sitting in — where the far edges are a couple of
+  pixels at the top of the frame and the camera has stopped reporting them — is not
+  recognised. `ISEC_MOUTH_ENABLE` is the switch for that case and it is off by
+  default; it requires the camera constants to be measured first. Either way it
+  fails the right way: the car drives the crossing as ordinary track, or stops in it.
+- A crossing arrived at well off line, close enough that only one black line is in
+  the picture at all, is not recognised even with the doorstep test on. One line
+  stopping is not distinguishable from a hairpin without a second opinion, and
+  trying it (`ISEC_MOUTH_ONE_SIDED`) measurably drives the car out of corners.
 - The steering holds heading, not position. The car leaves a crossing on the line it
   entered on, so if it arrives off-centre it stays off-centre until the corridor is
   believed again on the far side.

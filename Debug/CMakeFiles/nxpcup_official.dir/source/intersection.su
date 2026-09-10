@@ -2,8 +2,8 @@ C:/Users/victo/Desktop/git version/bootcamp_nxp/source/intersection.c:20:14:clam
 C:/Users/victo/Desktop/git version/bootcamp_nxp/source/intersection.c:47:13:to_ground	32	static
 C:/Users/victo/Desktop/git version/bootcamp_nxp/source/intersection.c:61:14:lat_at	16	static
 C:/Users/victo/Desktop/git version/bootcamp_nxp/source/intersection.c:75:16:collect_edges	96	static
-C:/Users/victo/Desktop/git version/bootcamp_nxp/source/intersection.c:177:13:build_cover	40	static
-C:/Users/victo/Desktop/git version/bootcamp_nxp/source/intersection.c:234:13:find_gap	48	static
-C:/Users/victo/Desktop/git version/bootcamp_nxp/source/intersection.c:393:6:Intersection_Init	16	static
-C:/Users/victo/Desktop/git version/bootcamp_nxp/source/intersection.c:413:6:Intersection_Update	440	static
-C:/Users/victo/Desktop/git version/bootcamp_nxp/source/intersection.c:583:6:Intersection_Advance	24	static
+C:/Users/victo/Desktop/git version/bootcamp_nxp/source/intersection.c:191:13:build_cover	40	static
+C:/Users/victo/Desktop/git version/bootcamp_nxp/source/intersection.c:248:13:find_gap	48	static
+C:/Users/victo/Desktop/git version/bootcamp_nxp/source/intersection.c:605:6:Intersection_Init	16	static
+C:/Users/victo/Desktop/git version/bootcamp_nxp/source/intersection.c:626:6:Intersection_Update	496	static
+C:/Users/victo/Desktop/git version/bootcamp_nxp/source/intersection.c:830:6:Intersection_Advance	24	static
