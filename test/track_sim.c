@@ -1310,6 +1310,119 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    if (argc > 2 && strcmp(argv[1], "-frame") == 0)
+    {
+        /* ---------------------------------------------------------------
+         * One frame in, one answer out: what would the car do with this?
+         *
+         * Vectors are given the way the Pixy2 reports them, on the 79 x 52
+         * grid, as x0,y0,x1,y1 - so a screenshot of the line tracker view can
+         * be measured off with a ruler and fed straight in.
+         *
+         *   ./track_sim -frame 1,51,38,8  38,8,7,2  62,51,75,21
+         *
+         * It prints where each vector really is on the track, what the corridor
+         * model makes of the frame, whether the crossing detector sees anything,
+         * and what the servo would be asked for.
+         * -------------------------------------------------------------*/
+        TrkSegment  sg[PIXY_MAX_VECTORS];
+        uint8_t     n = 0;
+        Intersection ix;
+        DriveCmd    cmd;
+        const DriveState *st;
+        int         i;
+
+        for (i = 2; (i < argc) && (n < PIXY_MAX_VECTORS); i++)
+        {
+            double a, b, c, d;
+
+            if (sscanf(argv[i], "%lf,%lf,%lf,%lf", &a, &b, &c, &d) != 4) continue;
+            sg[n].x0 = (float)a; sg[n].y0 = (float)b;
+            sg[n].x1 = (float)c; sg[n].y1 = (float)d;
+            n++;
+        }
+        if (n == 0)
+        {
+            printf("no vectors given\n");
+            return 1;
+        }
+
+        /* Settle the width model on this frame first, so the mounting reported
+         * below is the learned one the detector will use, not the fallback. */
+        Driver_Init();
+        Intersection_Init(&ix);
+        for (i = 0; i < 250; i++)
+        {
+            Driver_Step(true, sg, n, 0.016f, &cmd);
+        }
+
+        printf("=== what the car does with this frame ===\n");
+        printf("camera, learned from the width the car measures: focal %.0f px, "
+               "height %.0f cm, horizon row %.0f\n",
+               (double)PIXY_FOCAL_PX, (double)Track_CamHeightCm(),
+               (double)Track_HorizonRow());
+        printf("configured fallbacks, used only until it settles: height %.0f, "
+               "horizon %.0f\n\n", (double)CAM_HEIGHT_CM, (double)CAM_HORIZON_ROW);
+
+        printf("%-4s %-18s %-26s %s\n", "vec", "image", "on the track (cm)", "runs");
+        for (i = 0; i < (int)n; i++)
+        {
+            double hz = Track_HorizonRow();
+            double hh = Track_CamHeightCm();
+            double d0 = sg[i].y0 - hz;
+            double d1 = sg[i].y1 - hz;
+            double f0 = (d0 > 0.5) ? (PIXY_FOCAL_PX * hh / d0) : 0.0;
+            double f1 = (d1 > 0.5) ? (PIXY_FOCAL_PX * hh / d1) : 0.0;
+            double l0 = (CAM_CENTER_X - sg[i].x0) * f0 / PIXY_FOCAL_PX;
+            double l1 = (CAM_CENTER_X - sg[i].x1) * f1 / PIXY_FOCAL_PX;
+
+            printf("%-4d (%2.0f,%2.0f)->(%2.0f,%2.0f)  %5.0f cm ahead %+5.0f left ->"
+                   " %4.0f %+5.0f  %s\n", i,
+                   sg[i].x0, sg[i].y0, sg[i].x1, sg[i].y1, f0, l0, f1, l1,
+                   (fabs(f1 - f0) > fabs(l1 - l0)) ? "up the track" : "across it");
+        }
+
+        Intersection_Update(sg, n, &ix);
+        st = Driver_State();
+
+        printf("\n-- the corridor --\n");
+        printf("  usable rows      %d of %d%s\n", st->track.nValid, TRK_ROWS,
+               st->track.haveTrack ? "" : "   (not enough to drive on)");
+        printf("  both lines seen  %s\n", st->track.bothEdges ? "yes" : "no");
+        if (st->track.nValid > 0)
+        {
+            printf("  width at the bumper  %.0f px, centre %.0f  (39 = straight ahead)\n",
+                   st->track.width[0], st->track.center[0]);
+            printf("  heading near %+.2f  far %+.2f  (over ~1.5 is a real corner)\n",
+                   st->track.headNear, st->track.headFar);
+        }
+
+        printf("\n-- the crossing detector --\n");
+        printf("  lines running up the track: %d\n", ix.nEdges);
+        if (ix.seen)
+        {
+            printf("  HOLE FOUND on the %s: the lines stop %.0f cm ahead and start\n",
+                   (ix.sawLeft && ix.sawRight) ? "both sides"
+                                               : (ix.sawLeft ? "left" : "right"),
+                   ix.gapStartCm);
+            printf("  again %.0f cm ahead - a %.0f cm gap, which is one track width.\n",
+                   ix.gapEndCm, ix.gapCm);
+            printf("  it would commit at %.0f cm and drive straight over.\n",
+                   (double)ISEC_COMMIT_CM);
+        }
+        else
+        {
+            printf("  no crossing recognised from this frame alone.\n");
+        }
+
+        printf("\n-- what the servo is asked for --\n");
+        printf("  aim point   column %.1f  (39 = straight ahead)\n", st->line.targetX);
+        printf("  steer       %+.1f  (%s)\n", cmd.steer,
+               (cmd.steer > 3.0f) ? "right" : ((cmd.steer < -3.0f) ? "left" : "straight"));
+        printf("  speed       %.0f\n", cmd.speed);
+        return 0;
+    }
+
     if (argc > 1 && strcmp(argv[1], "-many") == 0)
     {
         /* ---------------------------------------------------------------

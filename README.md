@@ -106,28 +106,43 @@ or aimed too far down. Raise it or tilt it up. Within that envelope the car fini
 **18 out of 18** test configurations with zero line contact. Outside it, the firmware
 still fails safe — it slows down and stops rather than guessing — but it is slow.
 
-### 2b. Two numbers for the intersection detector
+### 2b. One number for the intersection detector, and it is not the camera
 
-Everything else in this firmware works in image columns and learns its own scale.
-Intersection detection cannot, because what it looks for is **a break in a black
-line about one track width long** — and that is a statement about the track, not
-about the picture. The same 45 cm gap is thirty image rows deep at the bumper and
-three near the horizon. So the frame is unprojected onto the ground before anything
-is measured, and that needs to know where the camera is:
+Intersection detection looks for **a break in a black line about one track width
+long**, and that is a statement about the track, not about the picture — the same
+45 cm gap is thirty image rows deep at the bumper and three near the horizon. So
+the frame has to be unprojected onto the ground before anything is measured, and
+for a while that meant measuring where the camera was.
 
-| Constant | How to get it |
-|---|---|
-| `CAM_HORIZON_ROW` | Put the car on a long straight. In PixyMon's line view, extend the two black lines until they meet. The row they meet on is this number — negative, because on any sanely aimed camera the meeting point is above the top of the frame. |
-| `CAM_HEIGHT_CM` | Height of the lens above the track surface. A ruler. |
+It does not any more. `track.c` already learns the corridor width as a straight
+line in image row, `width(y) = wA*y + wB`, and a track of constant real width only
+projects to a straight line like that if `wA` is the pixels of width per row
+*below the vanishing point*. So the fitted line reaches zero width exactly at the
+horizon:
 
-**Get these right before blaming anything else.** They scale every distance the
-detector measures. With them right, everything below is free — every circuit,
-chicane and camera-failure test runs identically with the feature in and out. With
-them wrong, distances come out scaled and the detector starts reading ordinary
-corners as crossings.
+    horizon row  =  -wB / wA
 
-That is measured, not theoretical, and it is why one half of the detector ships
-switched off:
+and the same identity hands over the camera height for nothing. `width_px = wA * d`
+identically, and `width_px = W * d / h` from the geometry, so
+
+    camera height  =  track width / wA
+
+The only thing you have to tell it is **`TRACK_WIDTH_M`** — how wide the track is,
+which is in the rulebook rather than on a ruler held against your car. It is
+already in `race_config.h` for the steering geometry.
+
+`CAM_HORIZON_ROW` and `CAM_HEIGHT_CM` are still there, but only as the fallback
+used for the first sixty frames while the width model settles. On a real mounting
+that is nothing like the defaults the difference is large and free: on one frame
+from a car whose camera is nowhere near 18 cm up, the configured constants made the
+track 18 cm wide and read the bar across the crossing as a line running *up* the
+track; the learned ones made it 40 cm wide and read the bar correctly.
+
+`PIXY_FOCAL_PX` stays a constant, but it is a property of every Pixy2 rather than
+of how yours is bolted on.
+
+One half of the detector still ships switched off, for reasons measured rather than
+argued:
 
 | | Ships | Finds | Needs the two numbers above to be |
 |---|---|---|---|
@@ -500,6 +515,22 @@ crossing and without, so the crossing's cost is isolated on every one of them.
     ./track_sim -many                 250 circuits, seed 1
     ./track_sim -many 500 7           500 circuits, seed 7
     ./track_sim -many 250 1 -q        totals only
+
+**One frame in, one answer out** (`./track_sim -frame ...`) — for the question that
+comes up every time someone looks at a PixyMon screenshot and wonders what the car
+would have done with it. Measure the vectors off the picture on the 79 x 52 grid and
+hand them over as `x0,y0,x1,y1`:
+
+    ./track_sim -frame 1,51,38,8  38,8,7,2  62,51,75,21
+
+It prints where each vector really is on the track in centimetres, whether it counts
+as running up the track or across it, what the corridor model made of the frame,
+whether the crossing detector saw anything, and what the servo would be asked for.
+
+The first two lines are the most useful thing in it and have nothing to do with
+crossings: if the two edges of a straight piece of track do not come out about one
+track width apart at the same distance ahead, `CAM_HORIZON_ROW` or `CAM_HEIGHT_CM`
+is wrong, and every distance the detector works in is wrong with it.
 
 Its random generator is deliberately *not* the one the fault injector uses. That
 injector calls it once per camera frame whether or not it is armed, so a change

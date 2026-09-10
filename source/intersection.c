@@ -5,6 +5,14 @@
 
 #define ISEC_MAX_EDGES 12u
 
+/* One camera vector lying across the track, kept for where its ends are. */
+typedef struct
+{
+    float f0, l0; /* the end nearer the car, cm ahead and cm to the left */
+    float f1, l1; /* the other end                                       */
+    float mid;    /* how far ahead its middle is                         */
+} Bar;
+
 /* One camera vector that runs up the track, described where it really is. */
 typedef struct
 {
@@ -46,14 +54,18 @@ static float clampf(float v, float lo, float hi)
  */
 static bool to_ground(float u, float v, float *fwd, float *lat)
 {
-    float d = v - CAM_HORIZON_ROW; /* rows below the vanishing point */
+    /* Learned, not configured - see Track_HorizonRow. Until the width model has
+     * settled these fall back to the constants in race_config.h. */
+    float hz = Track_HorizonRow();
+    float h  = Track_CamHeightCm();
+    float d  = v - hz; /* rows below the vanishing point */
 
     if (d < ISEC_MIN_ROWS_BELOW_HZ)
     {
         return false; /* at or near the horizon: no usable distance in it */
     }
 
-    *fwd = (PIXY_FOCAL_PX * CAM_HEIGHT_CM) / d;
+    *fwd = (PIXY_FOCAL_PX * h) / d;
     *lat = (CAM_CENTER_X - u) * (*fwd) / PIXY_FOCAL_PX;
     return true;
 }
@@ -73,14 +85,14 @@ static float lat_at(const Edge *e, float f)
  * away from the car, and where they stop.
  */
 static uint8_t collect_edges(const TrkSegment *segs, uint8_t n, Edge *out,
-                            float *barFwd, uint8_t *nBar)
+                            Bar *bars, uint8_t *nBar)
 {
     uint8_t i;
     uint8_t k = 0u;
 
     *nBar = 0u;
 
-    const float vMin = CAM_HORIZON_ROW + ISEC_MIN_ROWS_BELOW_HZ;
+    const float vMin = Track_HorizonRow() + ISEC_MIN_ROWS_BELOW_HZ;
 
     for (i = 0u; (i < n) && (k < ISEC_MAX_EDGES); i++)
     {
@@ -140,7 +152,11 @@ static uint8_t collect_edges(const TrkSegment *segs, uint8_t n, Edge *out,
              */
             if ((fabsf(dL) > ISEC_MIN_BAR_CM) && (*nBar < ISEC_MAX_EDGES))
             {
-                barFwd[*nBar] = 0.5f * (fNear + fFar);
+                bars[*nBar].f0  = fNear;
+                bars[*nBar].l0  = lNear;
+                bars[*nBar].f1  = fFar;
+                bars[*nBar].l1  = lFar;
+                bars[*nBar].mid = 0.5f * (fNear + fFar);
                 (*nBar)++;
             }
             continue;
@@ -402,8 +418,8 @@ static bool find_gap(const Edge *e, uint8_t n, bool left,
     return true;
 }
 
-/* ---- step 3: already at the mouth of one ------------------------------- */
-#if ISEC_MOUTH_ENABLE
+/* ---- step 3: the corner, and the doorstep ------------------------------ */
+#if ISEC_MOUTH_ENABLE || ISEC_JUNCTION
 
 /*
  * The other thing a crossing looks like, once the car is nearly on top of one.
@@ -422,7 +438,7 @@ static bool find_gap(const Edge *e, uint8_t n, bool left,
  *
  * Returns true and fills endCm with how far ahead the two lines stop.
  */
-static bool side_dead_end(const int8_t *owner, float *endCm)
+static bool side_dead_end(const int8_t *owner, float maxCm, float *endCm)
 {
     uint8_t b0, b1, b;
 
@@ -446,9 +462,9 @@ static bool side_dead_end(const int8_t *owner, float *endCm)
         return false; /* runs to the end of the scan: this line is not stopping */
     }
 
-    if (((float)b1 * ISEC_BIN_CM) > ISEC_MOUTH_CM)
+    if (((float)b1 * ISEC_BIN_CM) > maxCm)
     {
-        return false; /* stops, but too far out to be a doorstep */
+        return false; /* stops, but too far out for the caller to care */
     }
 
     if (((float)(b1 - b0) * ISEC_BIN_CM) < ISEC_MOUTH_MIN_RUN_CM)
@@ -511,14 +527,14 @@ static float side_slope(const Edge *e, uint8_t n, bool left)
  * stopped? That is the mouth of the crossing, or its far side, and it is the
  * difference between "the track is cut here" and "this is as far as I can see".
  */
-static bool bar_across(const float *barFwd, uint8_t nBar, float mouthCm)
+static bool bar_across(const Bar *bars, uint8_t nBar, float mouthCm)
 {
     uint8_t i;
 
     for (i = 0u; i < nBar; i++)
     {
-        if ((barFwd[i] > (mouthCm - ISEC_BAR_SLACK_CM)) &&
-            (barFwd[i] < (mouthCm + ISEC_BLIND_CROSS_CM + ISEC_BAR_SLACK_CM)))
+        if ((bars[i].mid > (mouthCm - ISEC_BAR_SLACK_CM)) &&
+            (bars[i].mid < (mouthCm + ISEC_BLIND_CROSS_CM + ISEC_BAR_SLACK_CM)))
         {
             return true;
         }
@@ -526,14 +542,79 @@ static bool bar_across(const float *barFwd, uint8_t nBar, float mouthCm)
     return false;
 }
 
+#if ISEC_JUNCTION
+/*
+ * Does a line lying across the track BEGIN where this edge stops?
+ *
+ * Not "is there a bar somewhere ahead", which is true of half the frames on a
+ * circuit with a start line on it. This asks whether one of the bar's own ends
+ * sits on the point where the black line the car is following runs out - which is
+ * the corner of the crossing, and is the thing a person looking at the picture
+ * sees immediately.
+ *
+ * It is the test the first version of this module tried and failed with, because
+ * it asked whether the corner was a right angle IN THE PICTURE, where perspective
+ * has already squashed it to something nearer 40 degrees. Asked on the ground,
+ * where Track_HorizonRow now puts it without anyone measuring the camera, the
+ * corner is just a corner.
+ */
+static bool bar_joins_at(const Bar *bars, uint8_t nBar, float fwd, float lat)
+{
+    uint8_t i;
+
+    for (i = 0u; i < nBar; i++)
+    {
+        float d0 = ((bars[i].f0 - fwd) * (bars[i].f0 - fwd)) +
+                   ((bars[i].l0 - lat) * (bars[i].l0 - lat));
+        float d1 = ((bars[i].f1 - fwd) * (bars[i].f1 - fwd)) +
+                   ((bars[i].l1 - lat) * (bars[i].l1 - lat));
+        float dm = (d0 < d1) ? d0 : d1;
+
+        if (dm < (ISEC_JOIN_CM * ISEC_JOIN_CM))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
+/* Where a side's black line stops, and how far to the left it is there. */
+static bool side_stop_point(const Edge *e, uint8_t n, bool left, float endCm,
+                            float *latOut)
+{
+    const Edge *best = NULL;
+    uint8_t     i;
+
+    for (i = 0u; i < n; i++)
+    {
+        if ((e[i].left != left) || (e[i].f0 >= endCm))
+        {
+            continue;
+        }
+        if ((best == NULL) || (e[i].len > best->len))
+        {
+            best = &e[i];
+        }
+    }
+
+    if (best == NULL)
+    {
+        return false;
+    }
+    *latOut = lat_at(best, endCm);
+    return true;
+}
+
+#if ISEC_MOUTH_ENABLE
 static bool find_mouth(const Edge *e, uint8_t nEdge,
                        const int8_t *coverL, const int8_t *coverR,
-                       const float *barFwd, uint8_t nBar,
+                       const Bar *bars, uint8_t nBar,
                        float *mouthCm, bool *left, bool *right)
 {
     float lEnd = 0.0f, rEnd = 0.0f;
-    bool  l    = side_dead_end(coverL, &lEnd);
-    bool  r    = side_dead_end(coverR, &rEnd);
+    bool  l    = side_dead_end(coverL, ISEC_MOUTH_CM, &lEnd);
+    bool  r    = side_dead_end(coverR, ISEC_MOUTH_CM, &rEnd);
 
 #if !ISEC_MOUTH_ONE_SIDED
     (void)e;
@@ -550,7 +631,7 @@ static bool find_mouth(const Edge *e, uint8_t nEdge,
         *mouthCm = (lEnd < rEnd) ? lEnd : rEnd;
 
 #if ISEC_MOUTH_NEEDS_BAR
-        if (!bar_across(barFwd, nBar, *mouthCm))
+        if (!bar_across(bars, nBar, *mouthCm))
         {
             return false;
         }
@@ -577,7 +658,7 @@ static bool find_mouth(const Edge *e, uint8_t nEdge,
      */
     if (l && side_empty(coverR) &&
         (side_slope(e, nEdge, true) <= ISEC_MOUTH_STRAIGHT) &&
-        bar_across(barFwd, nBar, lEnd))
+        bar_across(bars, nBar, lEnd))
     {
         *mouthCm = lEnd;
         *left    = true;
@@ -586,7 +667,7 @@ static bool find_mouth(const Edge *e, uint8_t nEdge,
     }
     if (r && side_empty(coverL) &&
         (side_slope(e, nEdge, false) <= ISEC_MOUTH_STRAIGHT) &&
-        bar_across(barFwd, nBar, rEnd))
+        bar_across(bars, nBar, rEnd))
     {
         *mouthCm = rEnd;
         *left    = false;
@@ -597,8 +678,9 @@ static bool find_mouth(const Edge *e, uint8_t nEdge,
 
     return false;
 }
-
 #endif /* ISEC_MOUTH_ENABLE */
+
+#endif /* ISEC_MOUTH_ENABLE || ISEC_JUNCTION */
 
 /* ---- public interface --------------------------------------------------- */
 
@@ -626,7 +708,7 @@ void Intersection_Init(Intersection *st)
 void Intersection_Update(const TrkSegment *segs, uint8_t n, Intersection *st)
 {
     Edge    edges[ISEC_MAX_EDGES];
-    float   barFwd[ISEC_MAX_EDGES];
+    Bar     bars[ISEC_MAX_EDGES];
     uint8_t nEdge, nBar;
     float   lStart = 0.0f, lEnd = 0.0f;
     float   rStart = 0.0f, rEnd = 0.0f;
@@ -635,7 +717,7 @@ void Intersection_Update(const TrkSegment *segs, uint8_t n, Intersection *st)
     st->sawLeft  = false;
     st->sawRight = false;
 
-    nEdge      = collect_edges(segs, n, edges, barFwd, &nBar);
+    nEdge      = collect_edges(segs, n, edges, bars, &nBar);
     st->nEdges = nEdge;
 
     /* ---------------------------------------------------------------
@@ -675,13 +757,52 @@ void Intersection_Update(const TrkSegment *segs, uint8_t n, Intersection *st)
         st->sawLeft  = find_gap(edges, nEdge, true, coverL, coverR, &lStart, &lEnd);
         st->sawRight = find_gap(edges, nEdge, false, coverR, coverL, &rStart, &rEnd);
 
+#if ISEC_JUNCTION
+        /* The corner: a black line the car is following stops, and one lying
+         * across the track begins at that exact point. Specific enough to be
+         * believed a long way out, which the doorstep test is not. */
+        if (!st->sawLeft && !st->sawRight)
+        {
+            uint8_t sd;
+
+            for (sd = 0u; sd < 2u; sd++)
+            {
+                bool   isLeft = (sd == 0u);
+                float  end = 0.0f, lat = 0.0f;
+
+                if (!side_dead_end(isLeft ? coverL : coverR,
+                                   ISEC_JUNCTION_CM, &end))
+                {
+                    continue;
+                }
+                if (!side_stop_point(edges, nEdge, isLeft, end, &lat))
+                {
+                    continue;
+                }
+                if (!bar_joins_at(bars, nBar, end, lat))
+                {
+                    continue;
+                }
+
+                st->sawLeft  = isLeft;
+                st->sawRight = !isLeft;
+                lStart       = end;
+                rStart       = end;
+                lEnd         = end + ISEC_BLIND_CROSS_CM;
+                rEnd         = lEnd;
+                st->atMouth  = true;
+                break;
+            }
+        }
+#endif
+
 #if ISEC_MOUTH_ENABLE
         if (!st->sawLeft && !st->sawRight)
         {
             float mouth = 0.0f;
             bool  ml = false, mr = false;
 
-            if (find_mouth(edges, nEdge, coverL, coverR, barFwd, nBar,
+            if (find_mouth(edges, nEdge, coverL, coverR, bars, nBar,
                            &mouth, &ml, &mr))
             {
                 /* The line stops with nothing beyond. The far side cannot be

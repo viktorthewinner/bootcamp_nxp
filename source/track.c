@@ -29,6 +29,67 @@ static float   s_prevWidth0;
 static bool    s_prevValid;
 static uint8_t s_rejects;
 
+static float clampf(float v, float lo, float hi)
+{
+    if (v < lo)
+    {
+        return lo;
+    }
+    if (v > hi)
+    {
+        return hi;
+    }
+    return v;
+}
+
+/*
+ * Where the horizon is, and how high the camera is, worked out from what the car
+ * has already measured.
+ *
+ * The width model is a straight line in image row: width(y) = wA*y + wB. A track
+ * of constant real width only projects to a straight line like that if wA is the
+ * pixels of width per row BELOW the vanishing point - so width(y) = wA * (y - hz),
+ * and the horizon is simply where the fitted line reaches zero width.
+ *
+ * The same identity gives the camera height for nothing. width_px = f * W / fwd
+ * and fwd = f * h / d, so width_px = W * d / h = (W/h) * d. Comparing that with
+ * width_px = wA * d gives h = W / wA, where W is the real width of the track - a
+ * number from the rulebook, not from a ruler held against the car.
+ *
+ * So the one part of this firmware that needed the camera measured does not need
+ * it any more. It needs the focal length, which is a property of every Pixy2 and
+ * not of how yours is bolted on, and it needs to be told how wide the track is.
+ *
+ * Both are clamped to values a sane mounting could produce, and both fall back to
+ * the constants in race_config.h until the width model has seen enough of the
+ * track to have an opinion.
+ */
+float Track_HorizonRow(void)
+{
+    float hz;
+
+    if ((s_frames < (uint32_t)TRK_WIDTH_FAST_FRAMES) || (s_wA < 0.2f))
+    {
+        return CAM_HORIZON_ROW;
+    }
+
+    hz = -s_wB / s_wA;
+    return clampf(hz, -60.0f, 10.0f);
+}
+
+float Track_CamHeightCm(void)
+{
+    float h;
+
+    if ((s_frames < (uint32_t)TRK_WIDTH_FAST_FRAMES) || (s_wA < 0.2f))
+    {
+        return CAM_HEIGHT_CM;
+    }
+
+    h = (TRACK_WIDTH_M * 100.0f) / s_wA;
+    return clampf(h, 6.0f, 60.0f);
+}
+
 float Track_WidthAtY(float y)
 {
     float w = (s_wA * y) + s_wB;
@@ -55,19 +116,6 @@ static void rebuild_width_model(void)
 }
 
 /* ---- small helpers ------------------------------------------------------ */
-
-static float clampf(float v, float lo, float hi)
-{
-    if (v < lo)
-    {
-        return lo;
-    }
-    if (v > hi)
-    {
-        return hi;
-    }
-    return v;
-}
 
 void Track_Init(void)
 {

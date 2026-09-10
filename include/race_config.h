@@ -636,6 +636,50 @@
  * So: measure the two camera numbers, check them, and then set this to 1. Not
  * before. Everything below it is live either way and needs no retuning.
  */
+/*
+ * The corner: a line the car is following stops, and one lying ACROSS the track
+ * begins at that same point.
+ *
+ * This is much more specific than the doorstep test below, which only asks whether
+ * a bar exists somewhere ahead - true of half the frames on a circuit with a start
+ * line on it. Requiring the bar to begin where the edge ends is asking for the
+ * corner of the crossing, which is the thing a person looking at the picture sees
+ * straight away, and it is specific enough to be believed a long way out.
+ *
+ * It is the test the first version of this module tried and failed with, because
+ * it asked whether the corner was square IN THE PICTURE, where perspective has
+ * already squashed a right angle to something nearer 40 degrees. Asked on the
+ * ground - which Track_HorizonRow now finds without anyone measuring the camera -
+ * a corner is just a corner.
+ *
+ * IT SHIPS OFF, BECAUSE IT ALSO DOES NOT WORK, and this one is worth writing down
+ * because it is the second time the same idea has been tried and the second
+ * different reason it failed. On the ground the corner really is square - but "a
+ * black line the car is following stops" is not a rare event. It is what happens
+ * every time the camera runs out of look-ahead, which is most frames. Pair that
+ * with "something lying across the track nearby", where anything not classified as
+ * an edge counts, and the coincidence turns up constantly. Measured over 250
+ * generated circuits it fires 265 times where there are 239 crossings, and takes
+ * the car from 180 clean runs to 72, one camera mounting in eighteen, and none of
+ * the eight camera-failure cases. Tightening the join distance to 10 cm does not
+ * help, which is the giveaway: the test is not nearly specific enough, and no
+ * threshold on it will be.
+ *
+ * What would make it specific is knowing that the edge stopped because it ENDED
+ * rather than because the camera stopped seeing it - and the frame does not carry
+ * that. That is the same wall the doorstep test below hits.
+ */
+#ifndef ISEC_JUNCTION
+#define ISEC_JUNCTION              0
+#endif
+#ifndef ISEC_JUNCTION_CM
+#define ISEC_JUNCTION_CM           130.0f
+#endif
+/* How close the bar's end has to be to where the edge stopped, on the ground. */
+#ifndef ISEC_JOIN_CM
+#define ISEC_JOIN_CM               18.0f
+#endif
+
 #ifndef ISEC_MOUTH_ENABLE
 #define ISEC_MOUTH_ENABLE          0
 #endif

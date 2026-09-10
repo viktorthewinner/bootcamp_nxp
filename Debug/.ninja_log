@@ -73,3 +73,11 @@
 49	293	8107703178981616	CMakeFiles/nxpcup_official.dir/source/driver.o	e1ae14fb31c9400d
 4	569	8107703178530905	CMakeFiles/nxpcup_official.dir/source/main.o	a34a9aa126d6988f
 569	1028	8107703184165812	nxpcup_official.axf	7a987a05598dc8f4
+594	2902	8107795617791447	CMakeFiles/nxpcup_official.dir/source/telemetry.o	6146954fd17297ee
+571	2908	8107795617590905	CMakeFiles/nxpcup_official.dir/source/driver.o	e1ae14fb31c9400d
+523	2911	8107795617098171	CMakeFiles/nxpcup_official.dir/source/track.o	3194fd55415a6809
+540	2912	8107795617269043	CMakeFiles/nxpcup_official.dir/source/racing_line.o	c6f9d1b48f51775
+582	2914	8107795617689593	CMakeFiles/nxpcup_official.dir/source/speed_ctl.o	8a3868506a2d4bb2
+557	2916	8107795617444524	CMakeFiles/nxpcup_official.dir/source/intersection.o	6b7a7797a9a1ea7f
+26	4698	8107795612125825	CMakeFiles/nxpcup_official.dir/source/main.o	a34a9aa126d6988f
+4698	7566	8107795658854974	nxpcup_official.axf	7a987a05598dc8f4

@@ -69,4 +69,11 @@ float Track_LearnedWidth(uint8_t row);
  * and half this width is how far from it the middle of the gap is. */
 float Track_WidthAtY(float y);
 
+/* The camera mounting, worked out from the width the car has measured rather
+ * than from a ruler: the width model reaches zero at the horizon, and its slope
+ * is the real track width divided by the camera height. intersection.c uses
+ * these instead of the constants in race_config.h once the model has settled. */
+float Track_HorizonRow(void);
+float Track_CamHeightCm(void);
+
 #endif /* TRACK_H */
