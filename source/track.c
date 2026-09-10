@@ -22,6 +22,13 @@ static float    s_wB;
 static float    s_widthModel[TRK_ROWS];
 static uint32_t s_frames;
 
+/* The nearest row of the last corridor that was believed, and how many frames in
+ * a row have been refused since. See the jump guard at the end of Track_Update. */
+static float   s_prevCenter0;
+static float   s_prevWidth0;
+static bool    s_prevValid;
+static uint8_t s_rejects;
+
 float Track_WidthAtY(float y)
 {
     float w = (s_wA * y) + s_wB;
@@ -77,7 +84,11 @@ void Track_Init(void)
     s_wB = TRK_WIDTH_NEAR_PX - (s_wA * yNear);
 
     rebuild_width_model();
-    s_frames = 0u;
+    s_frames      = 0u;
+    s_prevCenter0 = CAM_CENTER_X;
+    s_prevWidth0  = TRK_WIDTH_NEAR_PX;
+    s_prevValid   = false;
+    s_rejects     = 0u;
 }
 
 float Track_LearnedWidth(uint8_t row)
@@ -524,6 +535,60 @@ bool Track_Update(const TrkSegment *segs, uint8_t n, TrackModel *out)
     }
 
     out->haveTrack = (out->nValid >= 2u);
+
+#if TRK_JUMP_GUARD
+    /* ---------------------------------------------------------------
+     * The corridor may move. It may not teleport.
+     *
+     * Everything above works from one frame, and given a frame with the black
+     * lines missing - a crossing, mostly - it does not report that it is lost. It
+     * builds a corridor out of whatever else is in the picture and reports it as
+     * good, eight rows deep with both edges seen. Measured at a crossing: a
+     * corridor whose near heading is pinned at the clamp and an aim point on the
+     * right hand edge of the frame. The car steers off the track, and it does it
+     * with full confidence, which is the worst way to be wrong.
+     *
+     * What no real corridor does is move sideways by a third of the track, or
+     * change width by a third, between two frames 16 ms apart. At racing speed the
+     * car covers under two centimetres in that time. So a frame that disagrees
+     * with the one before it, at the row nearest the bumper where the geometry is
+     * least uncertain, is not a corridor - and the right thing to do with it is
+     * throw it away and coast on the last plan, which is exactly what the driver
+     * already does when it cannot see.
+     *
+     * The comparison is always against the last frame that was BELIEVED, not the
+     * last one seen, so a run of bad frames cannot walk the car anywhere. And the
+     * refusal is bounded: after TRK_JUMP_MAX_FRAMES the next frame is taken
+     * whatever it says, because a car that has genuinely been picked up and put
+     * down somewhere else has to be allowed to notice.
+     * -------------------------------------------------------------*/
+    if (out->haveTrack && s_prevValid && (s_rejects < (uint8_t)TRK_JUMP_MAX_FRAMES))
+    {
+        float dc = fabsf(out->center[0] - s_prevCenter0);
+        float dw = fabsf(out->width[0] - s_prevWidth0);
+
+        if ((dc > TRK_JUMP_CENTER_PX) || (dw > (TRK_JUMP_WIDTH_FRAC * s_prevWidth0)))
+        {
+            out->haveTrack = false;
+            s_rejects++;
+        }
+        else
+        {
+            s_rejects = 0u;
+        }
+    }
+    else
+    {
+        s_rejects = 0u;
+    }
+
+    if (out->haveTrack)
+    {
+        s_prevCenter0 = out->center[0];
+        s_prevWidth0  = out->width[0];
+        s_prevValid   = true;
+    }
+#endif
 
     /* ---------------------------------------------------------------
      * 4. Safety margins and headings.

@@ -51,7 +51,9 @@
 /* Image column the car actually drives along. 39 = dead centre. Shift it if the
  * camera is not perfectly aligned: drive slowly down a straight, and if the car
  * settles left of centre, lower this number. */
+#ifndef CAM_CENTER_X
 #define CAM_CENTER_X               39.0f
+#endif
 
 /* ---------------------------------------------------------------------
  * Where the camera is.
@@ -83,8 +85,12 @@
  * anything in the intersection block: a horizon that is several rows out scales
  * every distance the detector measures.
  * -------------------------------------------------------------------*/
+#ifndef CAM_HEIGHT_CM
 #define CAM_HEIGHT_CM              18.0f
+#endif
+#ifndef CAM_HORIZON_ROW
 #define CAM_HORIZON_ROW            (-4.0f)
+#endif
 
 /* Pixy2 I2C address (default 0x54). */
 #define PIXY_I2C_ADDR              0x54U
@@ -93,15 +99,23 @@
  * TRACK MODEL - where the corridor is sampled
  * Row 0 is nearest the car, the last row is farthest ahead.
  * ===================================================================*/
+#ifndef TRK_ROWS
 #define TRK_ROWS                   8
+#endif
+#ifndef TRK_ROW_Y_INIT
 #define TRK_ROW_Y_INIT             { 50, 44, 38, 32, 26, 20, 13, 6 }
+#endif
 
 /* Vectors flatter than this are start/finish lines or intersection bars, not
  * track edges. Steering off one of those ends a race. Measured in grid rows. */
+#ifndef TRK_MIN_VECTOR_DY
 #define TRK_MIN_VECTOR_DY          4
+#endif
 
 /* Vectors shorter than this are noise. */
+#ifndef TRK_MIN_VECTOR_LEN
 #define TRK_MIN_VECTOR_LEN         5.0f
+#endif
 
 /* How far a vector may be extended past its own endpoints to cover a sample row.
  *
@@ -114,25 +128,58 @@
  * Extending a line *away* from the car is the opposite: near the horizon a couple of
  * rows are a long way down the road, and guessing there is how a car ends up turning
  * into a corner that does not exist. So that direction stays tight. */
+#ifndef TRK_EXTRAP_NEAR_ROWS
 #define TRK_EXTRAP_NEAR_ROWS       10.0f
-#define TRK_EXTRAP_FAR_ROWS        3.0f
+#endif
+#ifndef TRK_EXTRAP_FAR_ROWS
+#define TRK_EXTRAP_FAR_ROWS        6.0f
+#endif
 
 /* A vector is only allowed to be extended by this multiple of its own length. A
  * long confident segment may reach a good way past its ends; a stubby one near the
  * horizon, where the line is almost vertical on screen, may barely move at all.
  * Without this, a 7 row scrap at the top of the frame gets stretched all the way
  * down to the bumper and reports a track edge that is nowhere near the real one. */
-#define TRK_EXTRAP_SPAN_K          1.5f
+/*
+ * ...and this is what carries the corridor over a crossing.
+ *
+ * A crossing takes both black lines away for about one track width. Stretching
+ * only 3 rows past the end of a segment is not far enough to reach the far side,
+ * so the corridor breaks, and what track.c then builds out of the rest of the
+ * frame is worse than nothing - see the note on TRK_JUMP_GUARD. Let a long,
+ * well supported segment be trusted three times its own span instead of one and a
+ * half, and the near edge reaches the far piece: the corridor never breaks and the
+ * crossing stops being an event.
+ *
+ * Measured over 250 generated circuits, each driven with a crossing and without:
+ *
+ *     far=3  span=1.5   181 clean without a crossing, 137 with one
+ *     far=6  span=3.0   180 clean without a crossing, 142 with one   <- this
+ *     far=10 span=3.0   178 clean without a crossing, 144 with one
+ *     far=14 span=3.0   172 clean without a crossing, 132 with one
+ *
+ * Past 6 rows it starts inventing track that is not there, and the cost lands on
+ * the circuits that have no crossing on them at all - which is most of them.
+ */
+#ifndef TRK_EXTRAP_SPAN_K
+#define TRK_EXTRAP_SPAN_K          3.0f
+#endif
 
 /* The bottom rows are usually outside the camera's sideways view, so once the
  * corridor has been built from the rows that were really seen, it is continued
  * downward to fill them in. This is how many leading rows may be filled that way. */
+#ifndef TRK_FILL_DOWN_MAX
 #define TRK_FILL_DOWN_MAX          5
+#endif
 
 /* Corridor width model, in pixels. Only a seed for the first frame or two - the car
  * measures the real thing and fits its own profile (see below). */
+#ifndef TRK_WIDTH_NEAR_PX
 #define TRK_WIDTH_NEAR_PX          120.0f
+#endif
+#ifndef TRK_WIDTH_FAR_PX
 #define TRK_WIDTH_FAR_PX           26.0f
+#endif
 
 /* The width profile is not eight independent numbers. Flat ground and a fixed camera
  * make the corridor width a straight line in image row: twice as far away is half as
@@ -141,18 +188,30 @@
  * on a real car almost never see both lines at once.
  *
  * Learning rate, and the faster rate used while the car is still sitting on the grid. */
+#ifndef TRK_WIDTH_ALPHA
 #define TRK_WIDTH_ALPHA            0.06f
+#endif
+#ifndef TRK_WIDTH_ALPHA_FAST
 #define TRK_WIDTH_ALPHA_FAST       0.35f
+#endif
+#ifndef TRK_WIDTH_FAST_FRAMES
 #define TRK_WIDTH_FAST_FRAMES      60
+#endif
 
 /* A measured width outside these multiples of the model is rejected as garbage. */
+#ifndef TRK_WIDTH_MIN_RATIO
 #define TRK_WIDTH_MIN_RATIO        0.45f
+#endif
+#ifndef TRK_WIDTH_MAX_RATIO
 #define TRK_WIDTH_MAX_RATIO        1.90f
+#endif
 
 /* When only one edge is visible the corridor is assumed slightly narrower than the
  * model. That biases the car toward the edge it can actually see, which is always
  * safer than drifting toward an edge it is only guessing at. */
+#ifndef TRK_ONE_EDGE_SHRINK
 #define TRK_ONE_EDGE_SHRINK        0.92f
+#endif
 
 /*
  * How far ahead the car is allowed to believe what it sees - the horizon guard.
@@ -174,13 +233,17 @@
  * car sees less far, and the speed planner slows down accordingly - which is the
  * right answer for a badly aimed camera.
  */
+#ifndef PIXY_FOCAL_PX
 #define PIXY_FOCAL_PX              68.0f  /* Pixy2 line grid, ~60 degree view over 79 px */
+#endif
 
 #ifndef TRK_MAX_LOOKAHEAD_WIDTHS
 #define TRK_MAX_LOOKAHEAD_WIDTHS   3.0f
 #endif
 
+#ifndef TRK_MIN_ROW_WIDTH_PX
 #define TRK_MIN_ROW_WIDTH_PX       (PIXY_FOCAL_PX / TRK_MAX_LOOKAHEAD_WIDTHS)
+#endif
 
 /*
  * Continuity: how far the corridor centre may move between two neighbouring sample
@@ -195,22 +258,88 @@
  *
  * So the model is simply cut off at the first row that jumps. The car then sees less
  * far, slows down, and drives the part of the road it is actually sure about. */
+#ifndef TRK_MAX_CENTER_STEP_FRAC
 #define TRK_MAX_CENTER_STEP_FRAC   0.90f
+#endif
+
+/*
+ * The corridor may move. It may not teleport.
+ *
+ * track.c works from one frame at a time, and handed a frame with the black lines
+ * missing - a crossing, mostly - it does not report that it is lost. It builds a
+ * corridor out of whatever else is in the picture and reports it as good. Measured
+ * at a crossing: eight rows, both edges seen, near heading pinned at the clamp,
+ * aim point on the right hand edge of the frame. The car steers off.
+ *
+ * These two numbers are what a real corridor is allowed to do between two frames
+ * 16 ms apart, measured at the row nearest the bumper. At racing speed the car
+ * covers under two centimetres in that time, so both are generous: 15 px is about
+ * 5 cm of sideways jump, and a third of the width is a third of the track.
+ *
+ * A frame that breaks either is thrown away and the driver coasts on the last plan
+ * - the same thing it already does when the camera sees nothing. Refusal is
+ * bounded by TRK_JUMP_MAX_FRAMES so a car that has really been moved can notice.
+ *
+ * IT SHIPS OFF, BECAUSE IT DOES NOT WORK, and that is worth recording so nobody
+ * spends an afternoon reinventing it. Over 250 generated circuits it buys 6 more
+ * clean runs on the ones with a crossing and gives up 7 on the ones without:
+ * refusing a frame means coasting, and coasting through a corner is its own way of
+ * leaving the track. Loosening the thresholds until the corners are safe loosens
+ * them past the point where they catch anything. The corridor at a crossing is
+ * better fixed by not letting it break in the first place - see TRK_EXTRAP_SPAN_K.
+ *
+ * The code is a dozen lines and costs nothing while it is off. Set it to 1 if you
+ * want to try again from a different angle.
+ */
+#ifndef TRK_JUMP_GUARD
+#define TRK_JUMP_GUARD             0
+#endif
+#ifndef TRK_JUMP_CENTER_PX
+#define TRK_JUMP_CENTER_PX         15.0f
+#endif
+#ifndef TRK_JUMP_WIDTH_FRAC
+#define TRK_JUMP_WIDTH_FRAC        0.35f
+#endif
+#ifndef TRK_JUMP_MAX_FRAMES
+#define TRK_JUMP_MAX_FRAMES        12
+#endif
 
 /* =====================================================================
  * SAFETY - the promise that the car stays inside the black lines
  * ===================================================================*/
 /* Keep-out band beside each line, as a fraction of the corridor width at that row,
- * with an absolute floor in pixels. The racing line may never cross into it. */
+ * with an absolute floor in pixels. The racing line may never cross into it.
+ *
+ * 0.30 rather than the 0.22 this started at, and it is worth knowing why, because
+ * the obvious reading - a wider keep-out band means a slower car - is wrong. It
+ * came out of test/robust.py, which drives twelve layouts from five starting
+ * offsets each instead of five layouts from one, and at 0.30 the car is:
+ *
+ *     56 of those 60 runs clean instead of 52
+ *     18 of 18 camera mountings clean instead of 15
+ *     clear of the black line by 2.9 cm at worst instead of 0.2 cm
+ *     and 1.5% FASTER over the five original circuits
+ *
+ * The band is what stops the racing line diving at an apex the car cannot
+ * actually hold. Widening it costs a little apex speed and saves the correction
+ * that follows, and on these layouts the correction was costing more.
+ *
+ * 0.22 is the old value if you want it back. Do not go to 0.26: it is worse than
+ * both, which is a reminder that this curve is not smooth and single knobs are
+ * worth measuring rather than reasoning about. */
 #ifndef SAFE_MARGIN_FRAC
-#define SAFE_MARGIN_FRAC           0.22f
+#define SAFE_MARGIN_FRAC           0.30f
 #endif
+#ifndef SAFE_MARGIN_MIN_PX
 #define SAFE_MARGIN_MIN_PX         5.0f
+#endif
 
 /* Shape of the path the car is assumed to follow toward the aim point when the
  * safety check runs. 1.0 = straight chord, 2.0 = lazy arc. 1.5 fits a car that
  * starts aligned and turns in. */
+#ifndef PATH_SHAPE_EXP
 #define PATH_SHAPE_EXP             1.5f
+#endif
 
 /* =====================================================================
  * RACING LINE - outside, inside, outside
@@ -219,13 +348,21 @@
 #ifndef LINE_APEX_BIAS
 #define LINE_APEX_BIAS             0.85f
 #endif   /* dive to the inside at the apex     */
+#ifndef LINE_ENTRY_BIAS
 #define LINE_ENTRY_BIAS            0.75f   /* hold the outside on the way in     */
+#endif
+#ifndef LINE_EXIT_BIAS
 #define LINE_EXIT_BIAS             0.45f   /* let it run wide on the way out     */
+#endif
+#ifndef LINE_BIAS_ALPHA
 #define LINE_BIAS_ALPHA            0.25f   /* smoothing, per new camera frame    */
+#endif
 
 /* Heading magnitude, in pixels of x per row of y, that counts as "fully in a corner".
  * Used to weigh entry / apex / exit against each other. */
+#ifndef LINE_HEAD_REF
 #define LINE_HEAD_REF              1.10f
+#endif
 
 /* Same idea for the entry phase alone, and deliberately smaller.
  *
@@ -233,7 +370,9 @@
  * picture the car is already in it, and there is no room left to reposition. So the
  * entry weight reaches full strength on a far heading well below a full corner,
  * while the apex weight still waits for the real thing. */
+#ifndef LINE_ENTRY_HEAD_REF
 #define LINE_ENTRY_HEAD_REF        0.60f
+#endif
 
 /* Aim point. Slow = look close and be precise, fast = look far and be smooth.
  *
@@ -263,7 +402,9 @@
  * three or more vectors the curve is properly described and the full racing line is
  * used. This is the belt; the braces are the PixyMon "Maximum merge distance" setting,
  * which is what stops the camera merging curves in the first place. */
+#ifndef LINE_CONF_SEGS_FULL
 #define LINE_CONF_SEGS_FULL        4    /* this many vectors = full confidence */
+#endif
 #ifndef LINE_CONF_MIN
 #define LINE_CONF_MIN              0.45f
 
@@ -298,14 +439,24 @@
  *     proper S bend        headFar ~2.5    curv ~3.6
  *     90 cm radius corner  headFar ~1.2    curv ~1.5
  */
+#ifndef CORNER_HEAD_IGNORE
 #define CORNER_HEAD_IGNORE         0.45f
+#endif
+#ifndef CORNER_HEAD_FULL
 #define CORNER_HEAD_FULL           1.20f
+#endif
+#ifndef CORNER_CURV_IGNORE
 #define CORNER_CURV_IGNORE         1.20f
+#endif
+#ifndef CORNER_CURV_FULL
 #define CORNER_CURV_FULL           2.60f
+#endif
 
 /* Used by the explicit S-shape detector: near and far bending opposite ways, with
  * neither of them bigger than this, is a chicane to be driven straight through. */
+#ifndef CHICANE_MAX_HEAD
 #define CHICANE_MAX_HEAD           0.50f
+#endif
 
 /* Steering deadband, as a fraction of full lock. It slides between these two:
  * the wide one when the road ahead is barely bending, the narrow one once it is
@@ -317,8 +468,12 @@
  * the car steers. So a long gentle curve is not ignored forever - the car drifts
  * across the track, using its width, and only corrects when it has to. Which is
  * precisely what a driver does. */
+#ifndef CHICANE_DEADBAND
 #define CHICANE_DEADBAND           0.08f
+#endif
+#ifndef CHICANE_DEADBAND_BIG
 #define CHICANE_DEADBAND_BIG       0.34f
+#endif
 
 /* =====================================================================
  * INTERSECTIONS - recognise a crossing by the hole it leaves, and go over it
@@ -347,18 +502,24 @@
  * ===================================================================*/
 /* Set to 0 and the whole feature compiles out: no detection, no override, and the
  * car behaves exactly as it did before the module existed. */
+#ifndef ISEC_ENABLE
 #define ISEC_ENABLE                1
+#endif
 
 /* An endpoint this close to the horizon is at an unusable distance - a single row
  * of quantisation moves it by a large fraction of how far away it is - so a vector
  * with an end up there is dropped rather than unprojected. */
+#ifndef ISEC_MIN_ROWS_BELOW_HZ
 #define ISEC_MIN_ROWS_BELOW_HZ     6.0f
+#endif
 
 /* What counts as a line running UP the track rather than across it: it must go at
  * least this much further away than it goes sideways. This is the test that throws
  * the crossing bars away, so it does not need to be tight - 1.0 is 45 degrees, and
  * a bar is nearer 90. */
+#ifndef ISEC_LONG_RATIO
 #define ISEC_LONG_RATIO            1.00f
+#endif
 
 /* Shortest edge worth believing, on the ground. The camera splits one black line
  * into a chain of short vectors and they get shorter the closer the car gets, so
@@ -366,12 +527,16 @@
  * stops a short vector's wobbly direction mattering is not this number: the scan
  * merges the chain back into one edge before measuring anything, and the parallel
  * test picks the longest piece on each side of the hole rather than the nearest. */
+#ifndef ISEC_MIN_EDGE_CM
 #define ISEC_MIN_EDGE_CM           5.0f
+#endif
 
 /* How far to one side of the car a line may be and still be part of its own track:
  * half a track width plus however far off centre the car is. Further out than this
  * belongs to another part of the circuit and must not be followed. */
+#ifndef ISEC_SIDE_MAX_CM
 #define ISEC_SIDE_MAX_CM           55.0f
+#endif
 
 /* The forward scan: how finely it looks and how many bins deep, so ISEC_BINS times
  * ISEC_BIN_CM is how far ahead it looks. The bin size is what makes overlapping,
@@ -380,21 +545,33 @@
  * of the same line and comfortably smaller than the crossing. ISEC_BINS is written
  * as a plain integer because it is an array size in intersection.c; keep it 127 or
  * less and the scan off the stack. */
+#ifndef ISEC_BIN_CM
 #define ISEC_BIN_CM                5.0f
+#endif
+#ifndef ISEC_BINS
 #define ISEC_BINS                  40u
+#endif
+#ifndef ISEC_SCAN_CM
 #define ISEC_SCAN_CM               ((float)ISEC_BINS * ISEC_BIN_CM)
+#endif
 
 /* The near piece has to reach at least this close to the car. An edge that only
  * appears out in the distance is not one the car is following, and the hole beyond
  * it says nothing about the track under the wheels. */
+#ifndef ISEC_EDGE_START_MAX_CM
 #define ISEC_EDGE_START_MAX_CM     70.0f
+#endif
 
 /* The white space. A crossing track is as wide as this one, so the hole it leaves
  * is about one track width - these are that, with room either side for the camera
  * losing a little of each edge at the mouth. Tighten them if something else on the
  * circuit is being read as a crossing. */
+#ifndef ISEC_GAP_MIN_CM
 #define ISEC_GAP_MIN_CM            25.0f
+#endif
+#ifndef ISEC_GAP_MAX_CM
 #define ISEC_GAP_MAX_CM            95.0f
+#endif
 
 /*
  * Require the edge to pick up again on the far side of the hole.
@@ -405,19 +582,27 @@
  * it off makes the detector fire on any edge that stops, which on a real circuit
  * is most of them.
  */
+#ifndef ISEC_REQUIRE_FAR_EDGE
 #define ISEC_REQUIRE_FAR_EDGE      1
+#endif
 
 /* How much of the far side of the hole has to be black line. A crossing puts a
  * whole track's worth of edge over there; a stub that happens to land beyond a gap
  * is what gets through when the camera calibration is out. */
+#ifndef ISEC_MIN_FAR_CM
 #define ISEC_MIN_FAR_CM            15.0f
+#endif
 
 /* How alike the two pieces have to be to count as the same black line: parallel to
  * within this much sideways per forward, and in line to within this many
  * centimetres where the far piece starts. A real crossing is in line to within the
  * grid quantisation, so these have plenty of room in them. */
+#ifndef ISEC_PARALLEL_TOL
 #define ISEC_PARALLEL_TOL          0.30f
+#endif
+#ifndef ISEC_COLLINEAR_CM
 #define ISEC_COLLINEAR_CM          15.0f
+#endif
 
 /*
  * The other way a crossing shows itself: the car is already on its doorstep.
@@ -451,10 +636,18 @@
  * So: measure the two camera numbers, check them, and then set this to 1. Not
  * before. Everything below it is live either way and needs no retuning.
  */
+#ifndef ISEC_MOUTH_ENABLE
 #define ISEC_MOUTH_ENABLE          0
+#endif
+#ifndef ISEC_MOUTH_CM
 #define ISEC_MOUTH_CM              55.0f
+#endif
+#ifndef ISEC_MOUTH_SKEW_CM
 #define ISEC_MOUTH_SKEW_CM         25.0f
+#endif
+#ifndef ISEC_BLIND_CROSS_CM
 #define ISEC_BLIND_CROSS_CM        55.0f
+#endif
 
 /*
  * Require a black line lying ACROSS the track, at or beyond where the edges
@@ -468,16 +661,24 @@
  * finished into runs that drive straight out of a corner. With it on the sweep is
  * untouched. Leave it on.
  */
+#ifndef ISEC_MOUTH_NEEDS_BAR
 #define ISEC_MOUTH_NEEDS_BAR       1
+#endif
 
 /* Shortest sideways run that counts as a line lying across the track, and how far
  * either side of the expected crossing the bar may sit and still be believed. */
+#ifndef ISEC_MIN_BAR_CM
 #define ISEC_MIN_BAR_CM            15.0f
+#endif
+#ifndef ISEC_BAR_SLACK_CM
 #define ISEC_BAR_SLACK_CM          25.0f
+#endif
 
 /* How much of the line has to have been in view before it stops. A two centimetre
  * fleck that ends is not a line the car was following. */
+#ifndef ISEC_MOUTH_MIN_RUN_CM
 #define ISEC_MOUTH_MIN_RUN_CM      10.0f
+#endif
 
 /*
  * Accept one line stopping when the other is not in the picture at all.
@@ -507,35 +708,53 @@
  * occasionally drives straight out of a corner. Only turn it on with a flight
  * recording that shows crossings actually being missed this way.
  */
+#ifndef ISEC_MOUTH_ONE_SIDED
 #define ISEC_MOUTH_ONE_SIDED       0
+#endif
+#ifndef ISEC_MOUTH_STRAIGHT
 #define ISEC_MOUTH_STRAIGHT        0.20f
+#endif
 
 /* Frames of agreement before the module is allowed to commit. Counts up on a
  * detection and down on a miss, so one dropped frame does not undo it. */
+#ifndef ISEC_CONFIRM_FRAMES
 #define ISEC_CONFIRM_FRAMES        2
+#endif
 
 /* The car commits when the mouth of the crossing is this close. Until then the
  * module is exactly invisible - it does not touch the steering at all, so on a
  * circuit with no crossings on it the car drives as if this file did not exist. */
+#ifndef ISEC_COMMIT_CM
 #define ISEC_COMMIT_CM             60.0f
+#endif
 
 /* How far past the far side of the hole to keep driving straight, so the back of
  * the car is out of the crossing before the corridor is believed again. */
+#ifndef ISEC_CLEAR_CM
 #define ISEC_CLEAR_CM              35.0f
+#endif
 
 /* The latch distance is measured, not guessed: it is however far the far side of
  * the hole was, plus ISEC_CLEAR_CM. These only stop a silly measurement buying a
  * silly amount of blind driving. */
+#ifndef ISEC_CROSS_MIN_M
 #define ISEC_CROSS_MIN_M           0.60f
+#endif
+#ifndef ISEC_CROSS_MAX_M
 #define ISEC_CROSS_MAX_M           1.60f
+#endif
 
 /* After a crossing, detections are ignored for this far. Coming out of one, the
  * edges behind look exactly like the near side of another. */
+#ifndef ISEC_COOLDOWN_M
 #define ISEC_COOLDOWN_M            0.60f
+#endif
 
 /* Backstop for a car that is not moving: no ground covered means the distance
  * budgets above never expire. Neither phase may outlast this. */
+#ifndef ISEC_PHASE_MAX_MS
 #define ISEC_PHASE_MAX_MS          3000.0f
+#endif
 
 /*
  * Lining up with the track.
@@ -549,25 +768,39 @@
  * and a clamp of 25 the command saturates at about 40 degrees off and is gentle
  * anywhere near straight.
  */
+#ifndef ISEC_HEAD_GAIN
 #define ISEC_HEAD_GAIN             30.0f
+#endif
+#ifndef ISEC_STEER_MAX
 #define ISEC_STEER_MAX             25.0f
+#endif
 
 /* If a frame comes back with nothing running up the track at all, the last command
  * is faded toward straight ahead by this factor rather than being held. */
+#ifndef ISEC_ALIGN_DECAY
 #define ISEC_ALIGN_DECAY           0.75f
+#endif
 
 /* Speed ceiling while crossing. The car is driving on a latch rather than on what
  * it can see, so it should not be doing it flat out. Raise to SPEED_MAX to remove
  * the cap entirely. */
+#ifndef ISEC_SPEED_CAP
 #define ISEC_SPEED_CAP             85.0f
+#endif
 
 /* =====================================================================
  * STEERING
  * Output units match Steer(): -100 .. +100, positive = right.
  * ===================================================================*/
+#ifndef STEER_OFFSET
 #define STEER_OFFSET               (-13.0f) /* servo value that points the wheels straight */
+#endif
+#ifndef STEER_LIMIT_RIGHT
 #define STEER_LIMIT_RIGHT          45.0f
+#endif
+#ifndef STEER_LIMIT_LEFT
 #define STEER_LIMIT_LEFT           (-60.0f)
+#endif
 
 /* Left and right trim, on top of the limits above.
  *
@@ -577,14 +810,24 @@
  * as the car quietly running wide out of every right hand corner.
  *
  * Only touch these if the car is measurably lazier on one side at the same command. */
+#ifndef STEER_GAIN_RIGHT
 #define STEER_GAIN_RIGHT           1.00f
+#endif
+#ifndef STEER_GAIN_LEFT
 #define STEER_GAIN_LEFT            1.00f
+#endif
 
 /* Controller. KP acts on how far the aim point sits beside the car, KH on which way
  * the track points right in front of the bumper, KD damps the pair. */
+#ifndef STEER_KP
 #define STEER_KP                   78.0f
+#endif
+#ifndef STEER_KH
 #define STEER_KH                   30.0f
+#endif
+#ifndef STEER_KD
 #define STEER_KD                   4.0f
+#endif
 
 /* =====================================================================
  * GEOMETRIC STEERING (pure pursuit)
@@ -635,18 +878,30 @@
 /* Road-wheel angle at a steering command of 100, radians. 30 degrees. */
 #define CAR_MAX_STEER_RAD          0.5236f
 
+#ifndef STEER_PP_K
 #define STEER_PP_K                 ((200.0f * (CAR_WHEELBASE_M / TRACK_WIDTH_M)) \
                                     / (PIXY_FOCAL_PX * PIXY_FOCAL_PX * CAR_MAX_STEER_RAD))
+#endif
 
 /* Multiplier on the geometric value. 1.0 is textbook pure pursuit, which tracks
  * a corner exactly but is leisurely about correcting a disturbance. Above 1.0
  * corrects harder and tucks the car inside the geometric line. */
+/*
+ * 1.15, down from 1.30, and it came out of the 250 circuit search rather than
+ * from theory. Once TRK_EXTRAP_SPAN_K stopped the corridor breaking at a
+ * crossing, the extra gain was correcting against a corridor that no longer
+ * needed correcting: 1.15 is a second a lap quicker over the five circuits, keeps
+ * the same number of generated circuits clean, and recognises more crossings
+ * because the car is straighter when it arrives at them.
+ */
 #ifndef STEER_PP_SCALE
-#define STEER_PP_SCALE             1.30f
+#define STEER_PP_SCALE             1.15f
 #endif
 
 /* Heading that saturates the KH term, in pixels of x per row of y. */
+#ifndef STEER_HEAD_SCALE
 #define STEER_HEAD_SCALE           1.10f
+#endif
 
 /*
  * Curvature feedforward, steering units per unit of track curv.
@@ -684,10 +939,14 @@
 #endif
 
 /* Servo rate limit, steering units per second. Stops the linkage from slamming. */
+#ifndef STEER_SLEW_PER_S
 #define STEER_SLEW_PER_S           900.0f
+#endif
 
 /* The D term runs on this much smoothing, to keep camera noise out of the servo. */
+#ifndef STEER_D_ALPHA
 #define STEER_D_ALPHA              0.40f
+#endif
 
 /* =====================================================================
  * SPEED - as fast as the situation allows, every single frame
@@ -742,13 +1001,21 @@
 #endif
 
 /* Global scale, handy for a quick trackside calm-down. 1.0 = full. */
+#ifndef SPEED_SCALE
 #define SPEED_SCALE                1.00f
+#endif
 
 /* How strongly each cue slows the car. The largest wins, so a corner seen far ahead
  * brakes the car early even while the road right in front is still straight. */
+#ifndef SPEED_W_HEAD_FAR
 #define SPEED_W_HEAD_FAR           1.05f
+#endif
+#ifndef SPEED_W_CURV
 #define SPEED_W_CURV               0.85f
+#endif
+#ifndef SPEED_W_STEER
 #define SPEED_W_STEER              0.90f
+#endif
 
 /* Corner severity that pins the car at SPEED_MIN. */
 #ifndef SPEED_SEVERITY_FULL
@@ -757,8 +1024,12 @@
 
 /* You may only drive as fast as you can see. Speed is scaled by how far ahead the
  * track model is still valid. */
+#ifndef SPEED_SEE_ROWS_FULL
 #define SPEED_SEE_ROWS_FULL        6       /* this many valid rows = no penalty */
+#endif
+#ifndef SPEED_SEE_ROWS_MIN
 #define SPEED_SEE_ROWS_MIN         2       /* at or below this = crawl          */
+#endif
 #ifndef SPEED_SEE_FLOOR
 #define SPEED_SEE_FLOOR            0.45f
 #endif
@@ -769,8 +1040,12 @@
 #endif
 
 /* Acceleration is ramped, braking is instant - same as a real car. Units per second. */
+#ifndef SPEED_ACCEL_PER_S
 #define SPEED_ACCEL_PER_S          140.0f
+#endif
+#ifndef SPEED_ACCEL_EXIT_PER_S
 #define SPEED_ACCEL_EXIT_PER_S     260.0f  /* corner exit: get on the power hard */
+#endif
 
 /* =====================================================================
  * LONGITUDINAL PLANT - what the motors actually do
@@ -824,9 +1099,15 @@
 /* PI gains, by pole cancellation at a 12 rad/s closed loop: Kp = tau*w/K,
  * Ki = Kp/tau. Expressed in duty percent per (m/s). Unused unless
  * SPEED_HAVE_FEEDBACK is 1. */
+#ifndef SPEED_KP
 #define SPEED_KP                   187.6f
+#endif
+#ifndef SPEED_KI
 #define SPEED_KI                   539.1f
+#endif
+#ifndef SPEED_I_LIMIT
 #define SPEED_I_LIMIT              0.60f
+#endif
 
 /* How much of the 348 ms lag to invert. 1.0 is exact inversion; below 1.0 is
  * gentler on the bridge, above 1.0 overdrives. Drop it if the car surges. */
@@ -838,11 +1119,19 @@
  * so asking for much more than that only saturates the bridge. The decel limit
  * is what the feedforward turns into a reverse command; COAST is used instead
  * whenever braking is not allowed. */
+#ifndef SPEED_ACC_MS2
 #define SPEED_ACC_MS2              3.00f
-#define SPEED_ACC_EXIT_MS2         6.00f  /* corner exit: let the reference run
-                                           * ahead so the duty pins at 100% */
+#endif
+/* corner exit: let the reference run ahead so the duty pins at 100% */
+#ifndef SPEED_ACC_EXIT_MS2
+#define SPEED_ACC_EXIT_MS2         6.00f
+#endif
+#ifndef SPEED_DEC_MS2
 #define SPEED_DEC_MS2              6.00f
+#endif
+#ifndef SPEED_COAST_MS2
 #define SPEED_COAST_MS2            2.50f
+#endif
 
 /* Master switch. 0 falls back to the original open-loop ramp and reverse brake
  * pulse, which is how test/compare.sh measures what this is worth. */
@@ -853,10 +1142,18 @@
 /* =====================================================================
  * BRAKING - short reverse pulse when the speed demand drops hard
  * ===================================================================*/
+#ifndef BRAKE_ENABLE
 #define BRAKE_ENABLE               1
+#endif
+#ifndef BRAKE_TRIGGER
 #define BRAKE_TRIGGER              16.0f   /* speed-unit deficit that starts a pulse */
+#endif
+#ifndef BRAKE_REVERSE_MAX
 #define BRAKE_REVERSE_MAX          28.0f   /* strongest reverse allowed              */
+#endif
+#ifndef BRAKE_MAX_MS
 #define BRAKE_MAX_MS               90.0f   /* never brake longer than this           */
+#endif
 
 /* =====================================================================
  * TORQUE VECTORING - slow the inside wheel through a corner
@@ -892,7 +1189,9 @@
 #define LOST_COAST_FRAMES          3
 #define LOST_SLOW_FRAMES           10
 #define LOST_STOP_FRAMES           30
+#ifndef SPEED_LOST
 #define SPEED_LOST                 20.0f
+#endif
 
 /* The same three stages, measured in metres of track covered blind rather than
  * in camera frames. Distance is the honest unit: a frame is a different amount
@@ -911,7 +1210,9 @@
 #endif
 
 /* If the camera says nothing at all for this long, cut the motors. */
+#ifndef CAM_TIMEOUT_MS
 #define CAM_TIMEOUT_MS             350.0f
+#endif
 
 /* Slowest the car may be scaled to when the camera is delivering frames slower than
  * it normally does. "Only as fast as you can see" applies to time as well as
@@ -920,6 +1221,8 @@
  *
  * The healthy frame rate is learned, not assumed, so a 30 Hz camera is not punished
  * for being a 30 Hz camera - only for suddenly becoming a 12 Hz one. */
+#ifndef CAM_RATE_FLOOR
 #define CAM_RATE_FLOOR             0.35f
+#endif
 
 #endif /* RACE_CONFIG_H */

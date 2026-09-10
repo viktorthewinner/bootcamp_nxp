@@ -28,6 +28,7 @@ chicane logic, and the speed planner.
 | `source/ticks.c` | Microsecond clock on SysTick, so the loop has a real `dt` |
 | `source/main.c` | Init, then a four-line loop |
 | `test/` | Host simulator that runs the real control code — see *Testing* |
+| `test/robust.py` | Tuning search gated on all sixty track runs, not five |
 
 `track.c`, `racing_line.c`, `intersection.c` and `driver.c` have **no SDK dependencies at all**. That is
 deliberate: it is what lets the whole perception and planning chain be compiled and
@@ -154,6 +155,34 @@ place the car, then the speed ramps in. If a wheel spins the wrong way, set
 ---
 
 ## Tuning, in the order that works
+
+Before anything else: **tune against `-tracks`, not against the five circuits.**
+The five circuits are each driven from one starting offset, and a tuning search
+will spend every centimetre of margin on the trajectories it is not being shown.
+`test/robust.py` runs twelve layouts from five offsets each and gates on all sixty,
+plus the camera faults and the eighteen in-envelope mountings, before it looks at
+time at all.
+
+That search is where `SAFE_MARGIN_FRAC = 0.30` came from, and it is the one change
+that was free in both directions:
+
+| | 0.22 (before) | 0.30 (now) |
+|---|---|---|
+| Sixty track runs clean | 52 | **56** |
+| Camera mountings clean, in envelope | 15/18 | **18/18** |
+| Camera mountings clean, out of envelope | 100/144 | **121/144** |
+| Worst clearance over the five circuits | +0.17 cm | **+2.89 cm** |
+| Five circuits, total lap time | 41.74 s | **41.12 s** |
+
+A wider keep-out band being *faster* is not the obvious result. The band is what
+stops the racing line diving at an apex the car cannot hold; widening it costs a
+little apex speed and saves the correction that follows, and on these layouts the
+correction was costing more. Note also that 0.26 is worse than both 0.22 and 0.30 —
+this curve is not smooth, so measure single knobs rather than reasoning about them.
+
+If the track has crossings on it and you would rather have the margin than the pace,
+`SPEED_MIN 68` on top of this is 58/60 and the best crossing result of anything
+measured (7 of 36), for about 5% of lap time. Going all the way to 59/60 costs 15%.
 
 1. **`SPEED_MIN`** (default 44) is the corner floor, and on this car it matters more than
    `SPEED_MAX`. It was originally 32, which turned out to be *counterproductive*: at low
@@ -374,23 +403,23 @@ Results with the shipped defaults:
 
 | Circuit | Lap | Closest approach to a line |
 |---|---|---|
-| Oval, 90 cm radius | 7.22 s | +4.96 cm |
-| Tight 180s, 55 / 80 cm | 5.92 s | +4.95 cm |
-| Chicane + sweepers | 8.10 s | +7.23 cm |
-| Mixed circuit, started off-centre | 6.02 s | +3.50 cm |
-| Narrow 35 cm track | 6.54 s | +0.03 cm |
+| Oval, 90 cm radius | 9.01 s | +5.20 cm |
+| Tight 180s, 55 / 80 cm | 7.10 s | +6.14 cm |
+| Chicane + sweepers | 10.17 s | +9.52 cm |
+| Mixed circuit, started off-centre | 7.22 s | +3.50 cm |
+| Narrow 35 cm track | 7.66 s | +2.08 cm |
 
 The 35 cm track is deliberately narrower than any real NXP Cup lane (45-60 cm) — the car
-is 14 cm wide, so it fills 40% of it. Every realistic circuit clears by 3.5 cm or more.
+is 14 cm wide, so it fills 40% of it. Every circuit clears by 2.9 cm or more.
 
 **Chicanes** — the little ones are ignored, and at full speed:
 
-| Feature | Peak steer | Speed through it | Result |
+| Feature | Peak steer | Speed through it | Peak offset |
 |---|---|---|---|
-| Tiny wiggle (~8 cm) | 9.5 | 267 cm/s (straight-line speed) | **ignored, drove straight through** |
-| Small chicane | 26.1 | 220 cm/s | mild correction |
-| Medium chicane | 52.6 | 114 cm/s | steered |
-| Real S bend | 60.0 | 118 cm/s | steered and braked |
+| Tiny wiggle (~8 cm) | 13.0 | 196 cm/s | 3.9 cm |
+| Small chicane | 45.0 | 168 cm/s | 6.1 cm |
+| Medium chicane | 60.0 | 129 cm/s | 5.5 cm |
+| Real S bend | 60.0 | 96 cm/s | 11.6 cm |
 
 **Intersections** (`./build_and_run.sh -isec`) — three separate checks:
 
@@ -435,6 +464,122 @@ The last two rows are the camera never reporting the far side of the crossing at
 all. The first needs the doorstep test switched on; the second needs it *and*
 `ISEC_MOUTH_ONE_SIDED`, which is off for good reason — see race_config.h. Both
 fail safe: the car drives the crossing as ordinary track, or stops in it.
+
+**Every layout, from five places on the track** (`./build_and_run.sh -tracks`, part 1)
+— twelve layouts, each driven from −12, −6, 0, +6 and +12 cm off the centre line:
+a long straight, a fast sweeper, a medium corner, a left hairpin and a right one, an
+S bend, a decreasing-radius and an increasing-radius corner, a double apex, the mixed
+circuit, and the same medium corner on 35 cm and 60 cm track.
+
+Where the car happens to be when it arrives at a corner is not a detail, it is the
+test. The five circuits above are each driven from **one** starting offset, so a
+tuning search is being scored on one trajectory per layout and will quietly spend
+every centimetre of margin on the other four without ever showing it. Sixty runs
+instead of five is what makes that visible.
+
+**A four road crossing in every part of every layout** (`-tracks`, part 2) — the same
+twelve layouts with a 45 cm crossing dropped in wherever a real one could go. A
+crossing is a straight tile, so it never sits on a curve, but the straight it sits on
+can be very short: the placements are quoted as the gap between the end of the corner
+and the near edge of the crossing, and "right at the exit" means the black lines stop
+the instant the corner does. Every case is run twice, with the crossing and without,
+so what the crossing costs is separated from what the corner costs.
+
+    ./build_and_run.sh -tracks        both parts
+    ./track_sim -tracks 4             layout 4 on its own
+    ./track_sim -tracks 4 -vv         ...frame by frame, with the vectors
+
+**A few hundred circuits nobody chose** (`./track_sim -many 250 1`) — twelve hand
+written layouts are twelve opinions about what a track looks like, and a tune can
+be fitted to them without anyone noticing. `-many` generates them from a seed
+instead: random corner radii and directions, random straight lengths, random track
+width, the car put down at a random offset, and a four road crossing dropped onto a
+straight wherever there is room for one. Each circuit is driven twice, with the
+crossing and without, so the crossing's cost is isolated on every one of them.
+
+    ./track_sim -many                 250 circuits, seed 1
+    ./track_sim -many 500 7           500 circuits, seed 7
+    ./track_sim -many 250 1 -q        totals only
+
+Its random generator is deliberately *not* the one the fault injector uses. That
+injector calls it once per camera frame whether or not it is armed, so a change
+that makes the car drive differently changes how many times it is called — and
+every circuit generated after that point. Two builds would be scored on two
+different sets of tracks, and the comparison would be worthless without ever
+looking wrong. That bug was in this file for about an hour and produced two
+confident, meaningless measurements before it was spotted.
+
+What it says about the shipped tune, and it is not comfortable reading:
+
+| | as shipped | before any of the retuning |
+|---|---|---|
+| Part 1, sixty runs | **55 clean** — the left hairpin from one offset, the S bend from three | 52 clean; six different layouts lost the car |
+| Part 2, thirty-six crossings | 5 clean, 17 not recognised, **14 off the track** | 5 / 14 / 17 |
+| 750 generated circuits, no crossing | **549 clean (73%)** | 467 (62%) |
+| 750 generated circuits, with one | **416 clean (55%)** | 342 (46%) |
+
+The 750 are three seeds of 250. Seeds 2 and 3 were never used to choose anything,
+and the improvement is the same size on all three, so it is a fix rather than a fit
+to the test set. Note that the number of crossings the detector *latches onto* went
+slightly **down** over those runs. That is the point: with the corridor no longer
+breaking, most crossings no longer need overriding at all.
+
+The part 1 number is the one worth having. Every layout in it is clean from the
+offset the five-circuit suite happens to use, so none of this was visible before —
+the mixed circuit was clean from +12 cm and from −12 cm and lost the car from the
+middle. Finding that is what produced the tuning change described under *Tuning*;
+the S bend from three of five offsets is what is left, and no tune in the search
+fixed it without giving up 15% of lap time.
+
+The crossing number is not a tuning problem, and that is worth being precise
+about. Three measurements say so:
+
+- Slowing the car right down (`SPEED_MAX` 100 → 70) moves it from 4 clean to 7.
+- With `ISEC_ENABLE 0` — the intersection module compiled out entirely — the same
+  runs fail the same way. The crossing breaks the perception, not the detector.
+- The frame trace shows why. At a crossing `track.c` does not lose the corridor,
+  it builds a **wrong** one and believes it: `rows=8 both=1 headNear=−4.00
+  targetX=78.0`, which is the aim point pinned to the right hand edge of the
+  picture. The car steers hard and leaves the track. Rejecting a saturated
+  heading as nonsense does not rescue it.
+
+Making the detector fire more often does not help either: bringing `ISEC_COMMIT_CM`
+in from 60 to 120 cm takes "not recognised" from 13 down to 9 and pushes "off the
+track" from 19 up to 24. Holding a straight line while the car is still unwinding
+out of a corner is the wrong thing to hold.
+
+The floor under all of it is the camera. On a 45 cm track a 60 degree lens cannot
+see either black line closer than about 57 cm, so a crossing whose mouth is nearer
+than that has no near piece left to measure — there is nothing there to recognise
+at the moment it matters most.
+
+### Fixing it
+
+Ten approaches were written down and the three most promising measured over 250
+generated circuits. The result is not what the shortlist predicted:
+
+| | Idea | Measured, against 181 clean without a crossing and 137 with one |
+|---|---|---|
+| 1+9 | Refuse a corridor that jumps, coast on the last one | **−7 / +6.** Refusing a frame means coasting, and coasting through a corner is its own way off the track. Loosening the thresholds until corners are safe loosens them past the point where they catch anything. |
+| 8 | Filter bar-like vectors harder in `track.c` | **−9 / −8.** The bars were not what the wrong corridor was made of. |
+| 10 | **Do not let the corridor break in the first place** | **−1 / +5.** Kept. |
+
+Idea 10 needed no new code. A crossing removes both black lines for about one track
+width, and `track.c` would only stretch a segment 3 image rows past its end — not
+far enough to reach the far side, so the corridor broke and it built something worse
+than nothing out of the rest of the frame. Letting a long, well supported segment be
+trusted three times its own span instead of one and a half (`TRK_EXTRAP_SPAN_K`) lets
+the near edge reach the far piece. The corridor never breaks and the crossing stops
+being an event.
+
+The two that failed are worth recording. `TRK_JUMP_GUARD` is still in `track.c`,
+switched off, with its numbers in the comment, so nobody spends an afternoon
+reinventing an idea that sounds obviously right and is not.
+
+What works after the fix: a crossing on a straight, or past a corner exit. What still
+does not: a crossing whose black lines stop at the instant a corner ends, where the
+car is looking at it from inside the corner and a 60 degree lens cannot see either
+line closer than about 57 cm.
 
 **Camera failure** — **no line contact in any of these**:
 
@@ -490,6 +635,18 @@ mountings, and that the chicane and racing-line behaviour is real rather than ho
 - The steering holds heading, not position. The car leaves a crossing on the line it
   entered on, so if it arrives off-centre it stays off-centre until the corridor is
   believed again on the far side.
+- **A crossing whose black lines stop where a corner ends is not driveable at the
+  shipped pace.** `-tracks` part 2 puts a four road crossing in every part of every
+  layout and only 5 of 36 come out clean. The cause is in `track.c`, not in the
+  crossing detector: across the gap it builds a corridor out of whatever is left in
+  the frame and reports it as good, and the car steers off the track. Until that is
+  fixed, treat a crossing immediately after a corner as a place the car will not
+  survive at speed.
+- **The tune is sensitive to where the car is when it arrives at a corner.** Eight of
+  the sixty runs in `-tracks` part 1 lose the car, all on layouts the five-circuit
+  suite calls clean. `test/robust.py` searches for a tune that does not, and finds
+  one at 59/60 — for about 15% of lap time. Which of those you want is a race
+  strategy decision, not a code one.
 - The build is `-O0`. Moving to `-O2` is free speed in the control loop if you want it,
   but it changes timing, so re-test rather than doing it the night before a race.
 - `RACE_DEBUG` must stay `0` when driving. The debug console is semihosted: with no
