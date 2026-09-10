@@ -451,7 +451,7 @@ static void plan_speed(void)
             v *= 0.90f;
         }
     }
-#if XSEC_FULL_POWER
+#if XSEC_FULL_POWER_AHEAD
     else
     {
         /*
@@ -467,6 +467,24 @@ static void plan_speed(void)
          * The gate is doing the work, not this line: the moment sev climbs past
          * XSEC_KEEP_POWER_SEV the whole branch swaps over, the ordinary rules
          * come back with the final say, and the junction waits its turn.
+         *
+         * Off by default, and this is why. The branch is only ever reached
+         * while a crossing is recognised AHEAD - once the car commits,
+         * plan_speed has already returned through xsec_hold_speed above - so
+         * everything it does rests on a recognition that has not been acted on
+         * yet and may be wrong. It is: rendered the way a real camera draws a
+         * frame, with each straight piece of paint one long vector, the bar
+         * test reads the top two rows of an ordinary corner as a crossing 62
+         * times over the five clean circuits, and each of those put the car to
+         * SPEED_MAX for as long as the corner cue stayed quiet. The car surges,
+         * the corner arrives, severity climbs, the branch swaps back and it
+         * brakes. Surge, brake, surge is what that feels like from outside.
+         *
+         * With this off a false approach costs nothing at all: the car simply
+         * does not lift for a corridor that has gone short, which is the whole
+         * conservative point of the feature, and a crossing it actually
+         * commits to still gets SPEED_MAX from xsec_hold_speed for the bounded
+         * distance of the latch.
          */
         v = SPEED_MAX;
     }
@@ -554,7 +572,15 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
         }
 
         {
-            bool haveTrack = Track_Update(segs, n, &s_st.track);
+            /*
+             * The track model is built from what the crossing detector, on its
+             * previous verdict, says is track: everything, unless a junction is
+             * in play, in which case the crossing's own edges are kept out of
+             * it. See Xsec_ForTrack.
+             */
+            TrkSegment trk[XSEC_MAX_SEGS];
+            uint8_t    nt = Xsec_ForTrack(&s_st.xsec, segs, n, trk);
+            bool       haveTrack = Track_Update(trk, nt, &s_st.track);
 
             /*
              * Look for a crossing before anything is planned, and do it whether

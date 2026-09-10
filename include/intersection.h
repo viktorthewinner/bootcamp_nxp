@@ -135,4 +135,43 @@ bool Xsec_Holding(const XsecState *s);
 /* True while the speed planner must not lift for a shrinking corridor. */
 bool Xsec_KeepPower(const XsecState *s);
 
+/* Room for the filtered copy below. Never fewer than the camera can send. */
+#define XSEC_MAX_SEGS 16u
+
+/*
+ * The vectors the track model should be built from, given what the crossing
+ * detector currently believes.
+ *
+ * While nothing is recognised this is every vector, untouched, so a lap with
+ * no junction on it is bit for bit the lap it always was. From the moment a
+ * crossing is recognised until the car is clear of it, vectors lying across
+ * the frame are left out.
+ *
+ * They have to be. track.c drops a vector spanning fewer than
+ * TRK_MIN_VECTOR_DY rows, on the grounds that it is a start line or a crossing
+ * bar, and that is not enough: a crossing edge a metre ahead is drawn across
+ * four or five rows while running thirty columns sideways, so it clears the
+ * test. It then arrives as an ordinary track edge, and since it lies across
+ * our corridor it is the innermost thing on its side and wins the row. The
+ * corridor centre jumps onto the other track, the headings triple, and the car
+ * steers off after it - which is also why it never gets to commit to the
+ * crossing, because the latch refuses while the near heading says the road is
+ * turning. Measured on a junction just past a bend: the car left the track by
+ * more than a metre on this alone, and does not with the filter in.
+ *
+ * The same test cannot be made unconditional inside track.c. Our own edges
+ * lie nearly as flat near the vanishing point in a tight corner - measured
+ * across the five circuits, 6522 vectors in a clean lap are flatter than a
+ * crossing edge needs to be - and throwing those away costs the corner.
+ * Gating it on the detector is what makes it safe: it only applies where a
+ * crossing has already been recognised, and there the flat vector is far more
+ * likely to be the thing that was recognised.
+ *
+ * The detector itself always gets the unfiltered list, since those bars and
+ * arms are exactly what it is looking for. Call with the state from the
+ * previous frame, before Track_Update.
+ */
+uint8_t Xsec_ForTrack(const XsecState *s, const TrkSegment *in, uint8_t n,
+                      TrkSegment *out);
+
 #endif /* INTERSECTION_H */

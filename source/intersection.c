@@ -839,6 +839,37 @@ bool Xsec_KeepPower(const XsecState *st)
     return (st->phase == XSEC_AHEAD) || (st->phase == XSEC_CROSSING);
 }
 
+uint8_t Xsec_ForTrack(const XsecState *st, const TrkSegment *in, uint8_t n,
+                      TrkSegment *out)
+{
+    uint8_t i, k = 0u;
+
+    if (n > (uint8_t)XSEC_MAX_SEGS)
+    {
+        n = (uint8_t)XSEC_MAX_SEGS;
+    }
+    for (i = 0u; i < n; i++)
+    {
+#if XSEC_ENABLE
+        if (st->phase != XSEC_IDLE)
+        {
+            float dx = absf(in[i].x1 - in[i].x0);
+            float dy = absf(in[i].y1 - in[i].y0);
+
+            if (dx > (XSEC_TRACK_FLAT * dy))
+            {
+                continue; /* lies across the road: the crossing's edge, not ours */
+            }
+        }
+#else
+        (void)st;
+#endif
+        out[k] = in[i];
+        k++;
+    }
+    return k;
+}
+
 /*
  * Freeze the steering for the drive through.
  *

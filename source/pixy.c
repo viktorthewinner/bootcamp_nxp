@@ -27,7 +27,47 @@
 #define PIXY_BUF_LEN        96u
 #define RESYNC_TRIES        16u
 
-#define XFER_TIMEOUT_US     6000u  /* a 100 kHz byte is 90 us; 6 ms is a dead bus */
+/*
+ * How long a transfer may take before the bus is declared dead.
+ *
+ * This has to scale with the number of bytes, and using one constant for every
+ * transfer was a real bug rather than a rough edge. At 100 kHz a byte is nine
+ * bits and 90 us, so a flat 6000 us covers 66 payload bytes - while
+ * PIXY_BUF_LEN says the driver will accept 96, and it duly asked for them.
+ * Anything longer was aborted: not a bus fault, just a read the bus had not
+ * been given time to finish.
+ *
+ * Which frames were being thrown away is the point. A payload carries two
+ * bytes of block header plus six per vector, and with PIXY_WANT_INTERSECTIONS
+ * another six plus four per branch:
+ *
+ *    2 vectors, junction, 3 branches   32 B   2.9 ms   fine
+ *    6 vectors, no junction            38 B   3.5 ms   fine
+ *    8 vectors, junction, 4 branches   72 B   6.6 ms   ABORTED
+ *   12 vectors, junction, 4 branches   96 B   8.7 ms   ABORTED
+ *
+ * A junction seen from a straight is the first line. A junction seen just
+ * after a corner is the third: the bend leaves both our own lines broken into
+ * pieces, the crossing adds its stubs, and the camera adds its intersection
+ * block - so the one frame the crossing detector most needs is the one frame
+ * the driver refused to finish reading.
+ *
+ * The abort costs more than the wait, too. It stops mid-packet, so the Pixy2
+ * is left half way through sending and the next read starts out of step and
+ * takes the resync path. One aborted frame becomes several lost ones, and
+ * lost frames are what driver.c reads as a camera that has slowed down - it
+ * scales the car's speed by the frame rate (CAM_RATE_FLOOR), and past
+ * LOST_COAST_M of no frames at all it caps the speed outright. That is the
+ * whole distance between a car that races and a car that crawls.
+ *
+ * So: a fixed part for the address byte, arbitration and DMA setup, plus the
+ * time the bytes themselves physically take, with a third over for margin.
+ * A dead bus during a full 96 byte payload now stalls the loop for 13 ms
+ * instead of 6 - about 3 cm of travel at racing speed, and two orders of
+ * magnitude inside CAM_TIMEOUT_MS.
+ */
+#define XFER_FIXED_US       2000u
+#define XFER_US_PER_BYTE    120u   /* 90 us of bus time, plus a third        */
 
 /* ---- transport ---------------------------------------------------------- */
 
@@ -52,6 +92,7 @@ static status_t pixy_xfer(pixy_t *cam, uint8_t *data, size_t len, bool read)
     lpi2c_master_transfer_t xfer;
     status_t                s;
     uint32_t                t0;
+    uint32_t                limit;
 
     if (len == 0u)
     {
@@ -76,10 +117,11 @@ static status_t pixy_xfer(pixy_t *cam, uint8_t *data, size_t len, bool read)
         return s;
     }
 
-    t0 = Ticks_Us();
+    t0    = Ticks_Us();
+    limit = XFER_FIXED_US + ((uint32_t)len * XFER_US_PER_BYTE);
     while (!cam->done)
     {
-        if ((Ticks_Us() - t0) > XFER_TIMEOUT_US)
+        if ((Ticks_Us() - t0) > limit)
         {
             (void)LPI2C_MasterTransferAbortEDMA(cam->instance, &cam->edmaHandle);
             cam->timeouts++;

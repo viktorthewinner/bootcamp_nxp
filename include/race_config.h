@@ -458,6 +458,18 @@
  * sweep that the geometry tests then had to reject. */
 #define XSEC_ELB_MAX_HEAD          0.70f
 
+/* Columns sideways per row spanned, above which a vector is taken to be lying
+ * across the road rather than running along it, and is kept out of the track
+ * model while a crossing is in play. See Xsec_ForTrack in intersection.h for
+ * why this is not simply done in track.c.
+ *
+ * 2.5 sits between the two populations with a factor of two either side. Our
+ * own edges run away from the camera: about one column per row, 1.2 at worst
+ * in a real frame with the car yawed twenty degrees. A crossing edge lies
+ * across the road, so under any mounting it is close to level - six columns
+ * per row in the frame this was measured on, and flatter the nearer it gets. */
+#define XSEC_TRACK_FLAT            2.5f
+
 /* The safety interlock, and the reason a hairpin can never be mistaken for a
  * crossing: the road through it has to be near enough straight. A corner that
  * puts a line sideways in the frame fails both of these, and a corner is exactly
@@ -621,6 +633,28 @@
 #define XSEC_FULL_POWER            1
 #endif
 
+/* ...and the same on the APPROACH to one, which is a different question and
+ * gets a different answer.
+ *
+ * Committing to a crossing is bounded: the car is on a held angle for
+ * XSEC_HOLD_M and then the corridor decides again. Merely recognising one
+ * ahead is not bounded by anything except being wrong, and the bar test is
+ * wrong more often than it looks. Drawn the way a real camera draws a frame -
+ * one long vector per straight piece of paint - the two edges of an ordinary
+ * corner flatten out at the top of the frame and leave a gap between their
+ * inner ends of 0.6 to 0.9 corridor widths, which is what a crossing leaves.
+ * That fires 62 times over the five clean circuits, none of them anywhere
+ * near a junction. None of them commits - the latch and the corner cues hold -
+ * but with full power on the approach each one puts the car to SPEED_MAX
+ * until the corner cue catches up, and the car surges and brakes its way
+ * round a lap.
+ *
+ * Off, a false approach costs nothing: the three cues a junction corrupts are
+ * stood down, which is all the feature ever claimed to need. */
+#ifndef XSEC_FULL_POWER_AHEAD
+#define XSEC_FULL_POWER_AHEAD      0
+#endif
+
 /* Set to 0 to build the firmware with intersection handling compiled out.
  * Worth doing once on a real track: everything else is unchanged, so it is a
  * clean A/B of what the feature is actually worth on your layout. */
@@ -637,11 +671,29 @@
  * It is recorded, not acted on. There is no Pixy2 firmware inside the host
  * simulator, so nothing here can be tested the way the geometric detector has
  * been, and an untested cue that can stop the car braking has no business
- * steering it. Drive a few laps with the flight recorder on, compare where the
- * camera flagged a junction against where intersection.c did, and if they agree
- * on your track this is the obvious thing to fold in next. */
+ * steering it.
+ *
+ * OFF by default, for two reasons that only became clear once the geometry
+ * could stand on its own.
+ *
+ * It cannot decide anything as things stand. cam_backs() is consulted in one
+ * place: to unlock a lone elbow when XSEC_ELB_SINGLE is 0. With it at 1 the
+ * geometry settles that case itself and the camera is never asked, so the
+ * block is pure cost.
+ *
+ * And the cost lands in the worst place. The block adds six bytes plus four
+ * per branch to the payload, and it arrives on exactly the frame a junction is
+ * in view - which is already the busiest frame there is, because a junction
+ * near a corner leaves both our lines in pieces and adds the crossing's stubs.
+ * At 100 kHz those bytes are the difference between a frame that arrives and
+ * one that does not: see the note on the transfer timeout in pixy.c.
+ *
+ * Turn it back on together with XSEC_ELB_SINGLE=0 if you want the camera to be
+ * the tie-breaker for a lone elbow again. Note also that the Pixy2 reports
+ * each intersection once, not on every frame it is visible, so the block is
+ * present far less often than a junction is. */
 #ifndef PIXY_WANT_INTERSECTIONS
-#define PIXY_WANT_INTERSECTIONS    1
+#define PIXY_WANT_INTERSECTIONS    0
 #endif
 
 /* =====================================================================

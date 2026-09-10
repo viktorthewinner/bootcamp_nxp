@@ -285,6 +285,10 @@ static bool project(const Cam *c, double fwd, double lat, double *u, double *v)
  * line into a small chain of vectors. Points are quantised to integers first.
  */
 static int g_fitChunks = 0;
+/* -fit on the command line: every edge everywhere, not just the cases that
+ * ask for it. The default thirds rule is what the rest of the suite was
+ * tuned against, so it stays the default. */
+static int g_fitAll = 0;
 #define FIT_TOL 1.0 /* cells a chain may stray from its chord and still be one vector */
 
 /* Chords fitted to the chain: one vector while every point sits within
@@ -323,7 +327,7 @@ static int emit_chunks(const double *ux, const double *vy, int np,
     int chunks, c, nseg = 0;
 
     if (np < 2 || maxOut < 1) return 0;
-    if (g_fitChunks) return emit_fit(ux, vy, 0, np - 1, out, maxOut);
+    if (g_fitChunks || g_fitAll) return emit_fit(ux, vy, 0, np - 1, out, maxOut);
 
     chunks = (np >= 12) ? 3 : ((np >= 6) ? 2 : 1);
     if (chunks > g_maxChunks) chunks = g_maxChunks;
@@ -770,6 +774,9 @@ typedef struct
     double peakLatWin;
     double minSpeedWin;
     int    winFrames;
+    int    xsSeen;      /* camera frames a crossing was recognised in   */
+    int    xsHeld;      /* control cycles driven on the held plan       */
+    int    xsTook;      /* crossings committed to                       */
     double peakHN;
     double peakHF;
     double peakSev;
@@ -800,6 +807,23 @@ static double g_profCnt[PROF_N];
 static double g_profBias[PROF_N];
 static double g_profWE[PROF_N];
 static double g_profHF[PROF_N];
+static double g_profYaw[PROF_N];
+
+/*
+ * Coming out of a corner: how far off the centre line the car is, and how far
+ * from parallel, at fixed distances past the point where the bend ends.
+ *
+ * The profile above averages over a bin and stops where the window stops, so
+ * it cannot answer "has it come back yet". This can. g_exitAt is the track
+ * distance at which the bend ends; the samples are taken the first time the
+ * car passes each of them.
+ */
+#define EXIT_N 5
+static const double g_exitAtCm[EXIT_N] = { 40.0, 80.0, 120.0, 160.0, 200.0 };
+static double g_exitFrom = -1.0;
+static double g_exitLat[EXIT_N];
+static double g_exitYaw[EXIT_N];
+static int    g_exitGot[EXIT_N];
 static int    g_profLo = -1, g_profHi = -1;
 
 static int g_winLo = -1;
@@ -957,10 +981,13 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
         }
 
         Driver_Step(fresh, allSegs, n, (float)dt, &cmd);
+        if (Driver_State()->xsec.phase == XSEC_CROSSING) r.xsHeld++;
 
         if (fresh)
         {
             const DriveState *st = Driver_State();
+            if (st->xsec.recognised) r.xsSeen++;
+            r.xsTook = (int)st->xsec.count;
             if (!st->track.haveTrack) r.lostFrames++;
             else if (!st->track.bothEdges) r.oneEdgeFrames++;
             if (st->line.chicane) r.chicaneFrames++;
@@ -1099,13 +1126,37 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
             r.winFrames++;
         }
 
+        if (g_exitFrom >= 0.0)
+        {
+            int e;
+
+            for (e = 0; e < EXIT_N; e++)
+            {
+                if (!g_exitGot[e] &&
+                    ((idx * g_step) >= (g_exitFrom + g_exitAtCm[e])))
+                {
+                    double yerr = car.th - g_cth[idx];
+
+                    while (yerr > M_PI) yerr -= 2.0 * M_PI;
+                    while (yerr < -M_PI) yerr += 2.0 * M_PI;
+                    g_exitLat[e] = lat;
+                    g_exitYaw[e] = yerr * 180.0 / M_PI;
+                    g_exitGot[e] = 1;
+                }
+            }
+        }
+
         if ((g_profLo >= 0) && (idx >= g_profLo) && (idx < g_profHi))
         {
             int bi = (int)((double)(idx - g_profLo) * PROF_N / (double)(g_profHi - g_profLo));
             if (bi >= 0 && bi < PROF_N) { const DriveState *ps = Driver_State();
                 g_profSum[bi] += lat; g_profCnt[bi] += 1.0;
                 g_profBias[bi] += ps->line.bias; g_profWE[bi] += ps->line.wEntry;
-                g_profHF[bi] += ps->track.headFar; }
+                g_profHF[bi] += ps->track.headFar;
+                { double yerr = car.th - g_cth[idx];
+                  while (yerr > M_PI) yerr -= 2.0 * M_PI;
+                  while (yerr < -M_PI) yerr += 2.0 * M_PI;
+                  g_profYaw[bi] += yerr * 180.0 / M_PI; } }
         }
 
         r.steps++;
@@ -1175,6 +1226,27 @@ static void dump_motor_map(void)
 
 int main(int argc, char **argv)
 {
+    /* -fit anywhere on the command line, then taken out of the way so the mode
+     * parsers below see the arguments they expect. */
+    {
+        int a;
+
+        for (a = 1; a < argc; a++)
+        {
+            if (strcmp(argv[a], "-fit") == 0)
+            {
+                int b;
+
+                g_fitAll = 1;
+                for (b = a; b < argc - 1; b++)
+                {
+                    argv[b] = argv[b + 1];
+                }
+                argc--;
+                a--;
+            }
+        }
+    }
     Cam cam;
     int verbose = (argc > 1 && strcmp(argv[1], "-v") == 0);
 
@@ -1321,6 +1393,44 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    if (argc > 1 && strcmp(argv[1], "-centre") == 0)
+    {
+        /*
+         * Straight road, car parallel to it and off to one side. Nothing else:
+         * no corner to unwind from, no chaos, nothing for a racing line to
+         * want. A car that drives the middle of the road comes back to the
+         * centre line; a car whose aim point is being pulled by a heading that
+         * is really its own offset does not.
+         */
+        Cam    cm;
+        Result r;
+        double off = (argc > 2) ? atof(argv[2]) : 10.0;
+        TrackSeg t[] = { {0.0, 900.0} };
+
+        cm.f = 68.0; cm.h = 18.0; cm.horiz = -4.0;
+        { int e; for (e = 0; e < EXIT_N; e++) { g_exitGot[e] = 0; g_exitLat[e] = 0.0; g_exitYaw[e] = 0.0; } }
+        g_exitFrom = 100.0;   /* let it get up to speed first */
+
+        printf("=== a straight road, started %.0f cm off centre and parallel ===\n", off);
+        r = run(t, 1, &cm, 22.5, off, "centring", 0, 30.0);
+        g_exitFrom = -1.0;
+
+        printf("+ is the side it started on, 0 is the centre line.\n\n");
+        printf("%-18s", "cm down the road");
+        {
+            int e;
+
+            for (e = 0; e < EXIT_N; e++) printf("%9.0f", 100.0 + g_exitAtCm[e]);
+            printf("\n%-18s", "off centre, cm");
+            for (e = 0; e < EXIT_N; e++) printf("%+9.1f", g_exitLat[e]);
+            printf("\n%-18s", "off parallel, deg");
+            for (e = 0; e < EXIT_N; e++) printf("%+9.1f", g_exitYaw[e]);
+            printf("\n");
+        }
+        printf("\nworst clearance %+.2f cm, %d excursions\n", r.minClear, r.excursions);
+        return 0;
+    }
+
     if (argc > 1 && strcmp(argv[1], "-line") == 0)
     {
         /* One long constant radius corner with a straight either side.
@@ -1329,7 +1439,7 @@ int main(int argc, char **argv)
         TrackSeg t[] = {
             {0.0, 260.0},
             {1.0 / 85.0, 85.0 * M_PI},
-            {0.0, 260.0},
+            {0.0, 420.0},   /* long enough to see the exit settle */
         };
         Cam cm;
         Result r;
@@ -1338,7 +1448,9 @@ int main(int argc, char **argv)
 
         cm.f = 68.0; cm.h = 18.0; cm.horiz = -4.0;
         if (argc > 2) g_maxChunks = atoi(argv[2]);
-        for (i = 0; i < PROF_N; i++) { g_profSum[i] = 0.0; g_profCnt[i] = 0.0; g_profBias[i]=0.0; g_profWE[i]=0.0; g_profHF[i]=0.0; }
+        for (i = 0; i < PROF_N; i++) { g_profSum[i] = 0.0; g_profCnt[i] = 0.0; g_profBias[i]=0.0; g_profWE[i]=0.0; g_profHF[i]=0.0; g_profYaw[i]=0.0; }
+        { int e; for (e = 0; e < EXIT_N; e++) { g_exitGot[e] = 0; g_exitLat[e] = 0.0; g_exitYaw[e] = 0.0; } }
+        g_exitFrom = 260.0 + (85.0 * M_PI);   /* where the bend ends */
         g_profLo = (int)(180.0 / g_step);
         g_profHi = (int)((260.0 + (85.0 * M_PI) + 120.0) / g_step);
 
@@ -1370,14 +1482,26 @@ int main(int argc, char **argv)
             else if (i < 19) phase = "exit";
             else             phase = "straight again";
 
-            printf("%s %+6.1fcm bias=%+5.2f wEntry=%4.2f hF=%+5.2f %s\n", bar, v,
+            printf("%s %+6.1fcm bias=%+5.2f yaw=%+6.1fdeg hF=%+5.2f %s\n", bar, v,
                    g_profBias[i]/(g_profCnt[i]>0?g_profCnt[i]:1),
-                   g_profWE[i]/(g_profCnt[i]>0?g_profCnt[i]:1),
+                   g_profYaw[i]/(g_profCnt[i]>0?g_profCnt[i]:1),
                    g_profHF[i]/(g_profCnt[i]>0?g_profCnt[i]:1), phase);
         }
         printf("\n%48s\n", "outside      centre      inside");
+        printf("yaw is the car heading minus the track heading. Zero is parallel with\n");
+        printf("the centre line, which is what the exit has to come back to.\n");
         printf("excursions=%d  minClearance=%+.2f cm  laptime=%.2fs\n",
                r.excursions, r.minClear, r.lapTime);
+
+        printf("\ncoming out of the corner - + is the inside, 0 is the centre line:\n");
+        printf("%-18s", "cm past the bend");
+        for (i = 0; i < EXIT_N; i++) printf("%9.0f", g_exitAtCm[i]);
+        printf("\n%-18s", "off centre, cm");
+        for (i = 0; i < EXIT_N; i++) printf("%+9.1f", g_exitLat[i]);
+        printf("\n%-18s", "off parallel, deg");
+        for (i = 0; i < EXIT_N; i++) printf("%+9.1f", g_exitYaw[i]);
+        printf("\n");
+        g_exitFrom = -1.0;
         return 0;
     }
 
@@ -1963,6 +2087,12 @@ int main(int argc, char **argv)
             { "after bend, one stub L",90.0, 22.5, 22.5, 0.0,        18.0, -4.0,  0, 0.0, 70.0, -1, 1 },
             { "after bend, one stub R",90.0, 22.5, 22.5, 0.0,        18.0, -4.0,  0, 0.0, 70.0, +1, 1 },
             { "tall, after bend, stub L",90.0, 22.5, 22.5, 0.0,      26.0, -10.0, 0, 0.0, 70.0, -1, 1 },
+            /* Closer still, which is the case that actually fails on the car:
+             * the bend ends and the junction is right there, so it arrives
+             * yawed and off centre with the exit line still unwinding. */
+            { "junction 15cm after bend", 90.0, 22.5, 22.5, 0.0,      18.0, -4.0,  0, 0.0, 95.0, -1, 1 },
+            { "junction right at exit",   90.0, 22.5, 22.5, 0.0,      18.0, -4.0,  0, 0.0, 110.0, -1, 1 },
+            { "tall, junction 15cm after",90.0, 22.5, 22.5, 0.0,      26.0, -10.0, 0, 0.0, 95.0, -1, 1 },
         };
         int i;
         int pass  = 0;
@@ -1978,8 +2108,8 @@ int main(int argc, char **argv)
          * against it, which is the only comparison that isolates the feature.
          */
         printf("=== intersections: does the junction cost anything? ===\n");
-        printf("%-22s %-15s %-15s %-7s %s\n",
-               "crossing", "minspd bare>x", "clearance b>x", "excurs", "verdict");
+        printf("%-22s %-15s %-15s %-6s %-7s %s\n",
+               "crossing", "minspd bare>x", "clearance b>x", "seen", "excurs", "verdict");
 
         for (i = 0; i < total; i++)
         {
@@ -1992,9 +2122,15 @@ int main(int argc, char **argv)
             /* The crossing sits at 300 cm whatever comes before it. */
             if (k[i].pre > 0.0)
             {
-                t[0].curv = 0.0;         t[0].len = 260.0 - k[i].pre - 40.0;
+                /* An R=120 bend of length `pre`, ending `gap` short of the
+                 * crossing at 300 cm: 70 -> 40 cm as before, 95 -> 15 cm,
+                 * 110 -> the junction sits at the exit itself. */
+                double gap = 110.0 - k[i].pre;
+
+                if (gap < 0.0) gap = 0.0;
+                t[0].curv = 0.0;         t[0].len = 300.0 - k[i].pre - gap;
                 t[1].curv = 1.0 / 120.0; t[1].len = k[i].pre;
-                t[2].curv = 0.0;         t[2].len = 40.0;
+                t[2].curv = 0.0;         t[2].len = gap;
                 t[3].curv = k[i].curv;   t[3].len = 340.0;
                 nt = 4;
             }
@@ -2060,15 +2196,19 @@ int main(int argc, char **argv)
                  (r.minClear >= (ctrl.minClear - 3.0));
 
             if (ok) pass++;
-            printf("%-22s %6.0f > %-6.0f %6.2f > %-6.2f %-7d %s\n",
+            printf("%-22s %6.0f > %-6.0f %6.2f > %-6.2f %-6s %-7d %s\n",
                    k[i].name, ctrl.minSpeedWin, r.minSpeedWin,
-                   ctrl.minClear, r.minClear, r.excursions,
+                   ctrl.minClear, r.minClear,
+                   (r.xsTook > 0) ? "TOOK" : ((r.xsSeen > 0) ? "saw" : "MISSED"),
+                   r.excursions,
                    !r.finished          ? "DID NOT FINISH"
                    : (r.excursions > 0) ? "LEFT THE TRACK"
                                         : (ok ? "costs nothing"
                                               : "the junction cost it"));
         }
         printf("\n%d of %d crossings cost the car nothing\n", pass, total);
+        printf("seen: TOOK = recognised and driven on the held plan, saw = recognised\n");
+        printf("but never committed, MISSED = never recognised at all.\n");
         return 0;
     }
 
