@@ -94,6 +94,7 @@ void Driver_Init(void)
     Track_Init();
     RL_Init();
     SpeedCtl_Init();
+    Intersection_Init(&s_st.isec);
 
     s_steer      = 0.0f;
     s_steerTgt   = 0.0f;
@@ -356,6 +357,42 @@ static void plan_speed(void)
                    (fabsf(m->headNear) > (0.30f * LINE_HEAD_REF));
 }
 
+/* ---- intersections ------------------------------------------------------ */
+#if ISEC_ENABLE
+
+/*
+ * Hand the steering over to the intersection module.
+ *
+ * Authority is zero until the module commits to a crossing and one after, so on a
+ * circuit with no crossings on it this file behaves exactly as it did before the
+ * module existed. The servo rate limit is what smooths the handover; the blend is
+ * written as a weight rather than a switch so that a gentler handover can be tried
+ * without touching driver.c.
+ *
+ * It runs after plan_speed on purpose. The speed planner reads the steering demand
+ * as one of its cues for how hard a corner is, and a crossing is not a corner -
+ * letting it see the override would make the car brake for the very thing it has
+ * just decided to drive straight through.
+ */
+static void plan_intersection(void)
+{
+    const Intersection *ix = &s_st.isec;
+    float               a;
+
+    if (ix->authority <= 0.0f)
+    {
+        return;
+    }
+
+    a          = clampf(ix->authority, 0.0f, 1.0f);
+    s_steerTgt = ((1.0f - a) * s_steerTgt) + (a * ix->steer);
+    s_steerTgt = clampf(s_steerTgt, STEER_LIMIT_LEFT, STEER_LIMIT_RIGHT);
+
+    s_st.steerTgt = s_steerTgt;
+}
+
+#endif /* ISEC_ENABLE */
+
 /* ---- main step ---------------------------------------------------------- */
 
 void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, DriveCmd *cmd)
@@ -368,6 +405,12 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
 
     s_st.elapsedMs += dt * 1000.0f;
     s_sinceFrame += dt;
+
+    /* Worked out here rather than further down because the intersection latch has
+     * to be gated on it: the car spends the start delay being placed on the grid,
+     * pointing at whatever it is pointing at, and a crossing committed to while it
+     * is sitting still would be in its cooldown by the time it moved. */
+    running = (s_st.elapsedMs >= START_DELAY_MS);
 
     /* ---- planning, only when there is something new to look at ---- */
     if (freshFrame)
@@ -392,22 +435,47 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
             }
         }
 
-        if (Track_Update(segs, n, &s_st.track))
         {
+            bool  trackOk = Track_Update(segs, n, &s_st.track);
             float dtFrame = clampf(s_sinceFrame, 1.0e-4f, 0.2f);
 
-            s_st.lostFrames = 0u;
-            RL_Compute(&s_st.track, s_speedFrac, &s_st.line);
-            plan_steering(dtFrame);
-            plan_speed();
-        }
-        else if (s_st.lostFrames < 0xFFFFu)
-        {
-            s_st.lostFrames++;
-        }
-        else
-        {
-            /* counter pinned, nothing more to do */
+#if ISEC_ENABLE
+            /* The RAW vectors, deliberately. Track_Update has already dropped
+             * everything close to horizontal, and the bar across a crossing is
+             * exactly one of those - a filtered list has no corner left in it.
+             * After Track_Update, though, so the width model has seen this frame. */
+            if (running)
+            {
+                Intersection_Update(segs, n, &s_st.isec);
+            }
+#endif
+
+            if (trackOk)
+            {
+                s_st.lostFrames = 0u;
+                RL_Compute(&s_st.track, s_speedFrac, &s_st.line);
+                plan_steering(dtFrame);
+                plan_speed();
+            }
+            else if (s_st.lostFrames < 0xFFFFu)
+            {
+                s_st.lostFrames++;
+            }
+            else
+            {
+                /* counter pinned, nothing more to do */
+            }
+
+#if ISEC_ENABLE
+            /* Last, so it overrides a plan that was made and is not fed back into
+             * one that has not been made yet. Note it runs whether or not the
+             * track model came out valid: driving straight over a crossing is the
+             * one case where a missing corridor is no obstacle at all. */
+            if (running)
+            {
+                plan_intersection();
+            }
+#endif
         }
 
         s_sinceFrame = 0.0f;
@@ -416,8 +484,6 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
     {
         s_blindMs += dt * 1000.0f;
     }
-
-    running = (s_st.elapsedMs >= START_DELAY_MS);
 
     /* ---- start up ---- */
     v = s_vTarget;
@@ -454,20 +520,41 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
      * the car parks itself in the middle of a dropout it could have driven
      * through. Metres do not have that problem.
      */
-    if (s_st.lostFrames > 0u)
     {
 #if SPEED_CLOSED_LOOP
-        s_blindM += SpeedCtl_State()->vEstMs * dt;
+        float stepM = SpeedCtl_State()->vEstMs * dt;
 #else
         /* The open-loop path never runs the observer, so read the speed straight
          * off the static map instead. It ignores the motor lag and so runs a
          * little ahead of the truth, which errs toward stopping sooner. */
-        s_blindM += SpeedCtl_SpeedForDuty(s_speedCmd) * dt;
+        float stepM = SpeedCtl_SpeedForDuty(s_speedCmd) * dt;
 #endif
-    }
-    else
-    {
-        s_blindM = 0.0f;
+
+        if (s_st.lostFrames == 0u)
+        {
+            s_blindM = 0.0f;
+        }
+        else if (!s_st.isec.crossing)
+        {
+            s_blindM += stepM;
+        }
+        else
+        {
+            /* Inside a crossing a missing corridor is the expected answer, not a
+             * failure, so the budget is frozen rather than spent - otherwise the
+             * car would slow to the lost-track crawl in the middle of every
+             * intersection it was deliberately driving through. Frozen, not reset:
+             * if it comes out the far side still blind, the budget carries on from
+             * where it stopped. And the freeze cannot run away, because the
+             * crossing latch is itself a bounded distance. */
+        }
+
+#if ISEC_ENABLE
+        if (running)
+        {
+            Intersection_Advance(&s_st.isec, stepM, dt);
+        }
+#endif
     }
 
     if (running)
@@ -510,6 +597,15 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
             /* brief dropout, carry on with the last plan */
         }
     }
+
+#if ISEC_ENABLE
+    /* Crossing on a latch means driving on a decision rather than on what can be
+     * seen right now. Not the moment to be doing it flat out. */
+    if (running && s_st.isec.crossing && (v > ISEC_SPEED_CAP))
+    {
+        v = ISEC_SPEED_CAP;
+    }
+#endif
 
     /* ---- brakes ----
      * Only worth doing from a real speed, and only once per braking event: the pulse

@@ -52,7 +52,7 @@ rule CUSTOM_COMMAND
 # Rule for re-running cmake.
 
 rule RERUN_CMAKE
-  command = C:\Users\victo\.mcuxpressotools\cmake-3.30.0-windows-x86_64\bin\cmake.exe --regenerate-during-build -S"C:\Users\victo\Desktop\nxpcup\race code\nxpcup_race" -B"C:\Users\victo\Desktop\nxpcup\race code\nxpcup_race\Debug"
+  command = C:\Users\victo\.mcuxpressotools\cmake-3.30.0-windows-x86_64\bin\cmake.exe --regenerate-during-build -S"C:\Users\victo\Desktop\git version\bootcamp_nxp" -B"C:\Users\victo\Desktop\git version\bootcamp_nxp\Debug"
   description = Re-running CMake...
   generator = 1
 

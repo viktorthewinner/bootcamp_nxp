@@ -64,4 +64,9 @@ bool Track_Update(const TrkSegment *segs, uint8_t n, TrackModel *out);
 /* Corridor width the model currently believes in, per row. For diagnostics. */
 float Track_LearnedWidth(uint8_t row);
 
+/* The same width profile evaluated at any image row, not just the eight sample
+ * ones. intersection.c needs it: a crossing corner turns up wherever it turns up,
+ * and half this width is how far from it the middle of the gap is. */
+float Track_WidthAtY(float y);
+
 #endif /* TRACK_H */

@@ -41,6 +41,7 @@ BEST_CL_FAST = ["-DSTEER_KFF=0.0f", "-DSPEED_MAX=100.0f", "-DSPEED_MIN=68.0f",
 SRC = [os.path.join(HERE, "track_sim.c"),
        os.path.join(ROOT, "source", "track.c"),
        os.path.join(ROOT, "source", "racing_line.c"),
+       os.path.join(ROOT, "source", "intersection.c"),
        os.path.join(ROOT, "source", "driver.c"),
        os.path.join(ROOT, "source", "speed_ctl.c")]
 

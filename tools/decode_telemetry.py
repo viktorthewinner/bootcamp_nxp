@@ -23,6 +23,7 @@ REC_SIZE = struct.calcsize(REC)
 
 F_HAVETRACK, F_BOTHEDGES, F_CHICANE = 0x01, 0x02, 0x04
 F_CLAMPED, F_BRAKING, F_RUNNING, F_BENCH = 0x08, 0x10, 0x20, 0x40
+F_ISEC = 0x80
 
 FIELDS = ("frame dtUs steer speed targetX headNear headFar curv bias "
           "widthNear widthFar centerNear nValid nVectors laRow flags "
@@ -87,12 +88,12 @@ def main():
         with open(args.csv, "w", newline="") as f:
             f.write("frame,dt_us,steer,speed,targetX,headNear,headFar,curv,bias,"
                     "widthNear,widthFar,centerNear,nValid,nVectors,laRow,"
-                    "haveTrack,bothEdges,chicane,clamped,braking,running,"
+                    "haveTrack,bothEdges,chicane,clamped,braking,running,crossing,"
                     "pixyErrors,pixyTimeouts\n")
             for r in recs:
                 fl = r["flags"]
                 f.write("%d,%d,%.1f,%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,"
-                        "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n" % (
+                        "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n" % (
                             r["frame"], r["dtUs"], r["steer"] / 10.0, r["speed"] / 10.0,
                             r["targetX"] / 10.0, r["headNear"] / 100.0,
                             r["headFar"] / 100.0, r["curv"] / 100.0, r["bias"] / 100.0,
@@ -102,6 +103,7 @@ def main():
                             1 if fl & F_HAVETRACK else 0, 1 if fl & F_BOTHEDGES else 0,
                             1 if fl & F_CHICANE else 0, 1 if fl & F_CLAMPED else 0,
                             1 if fl & F_BRAKING else 0, 1 if fl & F_RUNNING else 0,
+                            1 if fl & F_ISEC else 0,
                             r["pixyErrors"], r["pixyTimeouts"]))
         print("\nWrote %d frames to %s" % (len(recs), args.csv))
 
@@ -177,6 +179,11 @@ def main():
     print("  chicane ignored:      %.1f%%" % pct(sum(1 for r in run if r["flags"] & F_CHICANE), N))
     print("  safety override:      %.1f%%" % pct(sum(1 for r in run if r["flags"] & F_CLAMPED), N))
     print("  braking:              %.1f%%" % pct(sum(1 for r in run if r["flags"] & F_BRAKING), N))
+    isec = [i for i, r in enumerate(run) if r["flags"] & F_ISEC]
+    # One crossing is a run of consecutive frames; count the runs, not the frames.
+    crossings = sum(1 for j, i in enumerate(isec) if j == 0 or i != isec[j - 1] + 1)
+    print("  intersections crossed: %d  (%.1f%% of frames)"
+          % (crossings, pct(len(isec), N)))
 
     # ---- verdicts --------------------------------------------------------
     print("\n-- WHAT THIS MEANS --")

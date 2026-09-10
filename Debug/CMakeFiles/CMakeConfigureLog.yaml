@@ -74,7 +74,7 @@ events:
       Compilation of the C compiler identification source "CMakeCCompilerId.c" produced "CMakeCCompilerId.su"
       
       The C compiler identification is GNU, found in:
-        C:/Users/victo/Desktop/nxpcup/race code/nxpcup_race/Debug/CMakeFiles/3.30.0/CompilerIdC/CMakeCCompilerId.o
+        C:/Users/victo/Desktop/git version/bootcamp_nxp/Debug/CMakeFiles/3.30.0/CompilerIdC/CMakeCCompilerId.o
       
   -
     kind: "message-v1"
@@ -128,7 +128,7 @@ events:
       Compilation of the CXX compiler identification source "CMakeCXXCompilerId.cpp" produced "CMakeCXXCompilerId.su"
       
       The CXX compiler identification is GNU, found in:
-        C:/Users/victo/Desktop/nxpcup/race code/nxpcup_race/Debug/CMakeFiles/3.30.0/CompilerIdCXX/CMakeCXXCompilerId.o
+        C:/Users/victo/Desktop/git version/bootcamp_nxp/Debug/CMakeFiles/3.30.0/CompilerIdCXX/CMakeCXXCompilerId.o
       
 ...
 

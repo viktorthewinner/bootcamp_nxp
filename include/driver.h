@@ -18,6 +18,9 @@
  *   diff      the inside wheel is slowed in a corner, which rotates the car into
  *             the turn instead of pushing it wide
  *
+ *   crossings a recognised intersection takes the steering off all of the above
+ *             and drives the car straight over it - see intersection.h
+ *
  * No SDK calls live here, so the whole control chain can be run on a PC against a
  * simulated track.
  */
@@ -28,6 +31,7 @@
 #include <stdint.h>
 #include "track.h"
 #include "racing_line.h"
+#include "intersection.h"
 
 typedef struct
 {
@@ -40,8 +44,9 @@ typedef struct
 
 typedef struct
 {
-    TrackModel track;
-    RacingLine line;
+    TrackModel   track;
+    RacingLine   line;
+    Intersection isec;
     float      severity;  /* 0 straight, 1 slowest corner  */
     float      steerTgt;
     uint16_t   lostFrames;

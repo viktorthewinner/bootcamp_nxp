@@ -23,12 +23,13 @@ chicane logic, and the speed planner.
 | `source/track.c` | Pixy2 vectors → where the two black lines are, at 8 distances ahead |
 | `source/racing_line.c` | Picks the point to aim at, then forces it back inside the lines |
 | `source/driver.c` | Steering controller + speed planner + brakes + torque vectoring |
+| `source/intersection.c` | Spots a crossing and drives straight over it |
 | `source/pixy.c` | Pixy2 line-tracking driver (rewritten — see below) |
 | `source/ticks.c` | Microsecond clock on SysTick, so the loop has a real `dt` |
 | `source/main.c` | Init, then a four-line loop |
 | `test/` | Host simulator that runs the real control code — see *Testing* |
 
-`track.c`, `racing_line.c` and `driver.c` have **no SDK dependencies at all**. That is
+`track.c`, `racing_line.c`, `intersection.c` and `driver.c` have **no SDK dependencies at all**. That is
 deliberate: it is what lets the whole perception and planning chain be compiled and
 raced on a PC before it ever touches the car.
 
@@ -103,6 +104,29 @@ If the lines leave the sides of the picture before the middle row, the camera is
 or aimed too far down. Raise it or tilt it up. Within that envelope the car finished
 **18 out of 18** test configurations with zero line contact. Outside it, the firmware
 still fails safe — it slows down and stops rather than guessing — but it is slow.
+
+### 2b. Two numbers for the intersection detector
+
+Everything else in this firmware works in image columns and learns its own scale.
+Intersection detection cannot, because what it looks for is **a break in a black
+line about one track width long** — and that is a statement about the track, not
+about the picture. The same 45 cm gap is thirty image rows deep at the bumper and
+three near the horizon. So the frame is unprojected onto the ground before anything
+is measured, and that needs to know where the camera is:
+
+| Constant | How to get it |
+|---|---|
+| `CAM_HORIZON_ROW` | Put the car on a long straight. In PixyMon's line view, extend the two black lines until they meet. The row they meet on is this number — negative, because on any sanely aimed camera the meeting point is above the top of the frame. |
+| `CAM_HEIGHT_CM` | Height of the lens above the track surface. A ruler. |
+
+**Get these right before blaming anything else.** They scale every distance the
+detector measures, so a horizon several rows out will make it miss crossings, and a
+height badly out can make it read something else as one. That is not theoretical:
+in the robustness sweep, the two mountings furthest from these values were the only
+ones where the detector ever fired on a circuit with no crossings on it, and closing
+that took an extra check rather than a threshold change. If you would rather not
+have the feature at all, set `ISEC_ENABLE 0` and the car behaves exactly as it did
+without it.
 
 ### 3. First power-up
 
@@ -192,6 +216,37 @@ image, the car lifts and brakes **before** the corner rather than in the middle 
   inside down by the same amount - which rotates the car into the turn without costing
   any drive. Slowing only the inside wheel, the obvious way to do this, quietly throws
   away up to a fifth of the thrust at full lock, exactly where the car needs it most
+
+**Crossings.** An intersection is the one place the track model is actively wrong:
+two more black lines cut across the corridor, `track.c` throws them away as start
+lines, and what is left opens out sideways for a few frames — so the racing line
+aims at the gap and the car turns down the crossing track. `intersection.c` gets in
+first, and it looks for the hole rather than for the corners. The edge the car is
+following stops, there is about one track width of white space, and then the same
+edge picks up again on the far side, parallel to where it left off and in line with
+it. The bars across the mouth are never used — they are thrown away with everything
+else that does not run up the track.
+
+Requiring the far piece is what makes this specific. A plain corner does not look
+like this: its edges are continuous, and when one leaves the side of the picture
+nothing appears beyond it. Neither does a start line, which is a bar across an
+unbroken pair of edges. And the *other* edge gets a veto — a crossing cuts both
+black lines at the same place, so if the line on the far side of the car runs
+straight through the hole, the hole is this edge dropping out while the track
+carries on.
+
+Then the car lines itself up **parallel to the track and drives**. Parallel, not
+centred: the visible edges have a heading relative to the car, the steering nulls
+it, and holding that means the car comes out of the crossing on the same line it
+went in on. Aiming at a computed centre would need the corridor width, which is
+exactly the thing that cannot be measured inside a crossing. How far to drive is
+not a guess either — the gap was measured on the way in, so the latch runs to the
+far side of it plus the length of the car. While it is crossing, the lost-track
+budget is frozen, since a missing corridor there is the expected answer rather than
+a failure.
+
+Until it commits, the module changes nothing at all. That is checked, not assumed:
+every simulation mode is byte-identical with it compiled in and with `ISEC_ENABLE 0`.
 
 **Ignoring the small stuff.** The steering deadband is not fixed — it slides from wide to
 narrow depending on how corner-like the road is. Crucially, corner-ness is judged from
@@ -310,6 +365,41 @@ is 14 cm wide, so it fills 40% of it. Every realistic circuit clears by 3.5 cm o
 | Medium chicane | 52.6 | 114 cm/s | steered |
 | Real S bend | 60.0 | 118 cm/s | steered and braked |
 
+**Intersections** (`./build_and_run.sh -isec`) — three separate checks:
+
+*The scan on its own.* Fifteen cases, written in centimetres where the black lines
+really sit on the track and then projected into the frame and rounded to whole
+pixels the way the Pixy2 would report them. A crossing is found whether it breaks
+the left edge, the right edge or both, with the car up to 15° off line, and with
+the near edge arriving as a chain of three separate vectors. An unbroken edge, an
+edge that simply runs out of look-ahead, a 10 cm camera dropout, a 140 cm hole, a
+far piece that is not parallel, one that is 40 cm out of line, an edge with nothing
+near the car, and a frame containing only the crossing bars are all rejected. The
+last two cases check the steering points the right way.
+
+*False alarms.* Four ordinary circuits with no crossing anywhere on them, ~2000
+camera frames including two hairpins and a 35 cm-wide track. **Not one frame is
+even detected**, let alone committed to.
+
+*Driving through one.* The main edges stop for the width of the crossing track and
+pick up again on the far side, with four bars run out of the corners — exactly what
+the camera would see. Each case runs twice, once with the crossing and once with the
+same stretch left whole, because a racing line uses the width of the track on
+purpose and without the control there is no telling which put the car where:
+
+| Case | Frames detected | Committed | Peak offset, crossing / no crossing | Result |
+|---|---|---|---|---|
+| Straight, crossing at 3 m | 31 | 1 | 0.2 cm / 0.6 cm | straight through |
+| Same, car starts 10 cm left | 34 | 1 | 6.4 cm / 6.3 cm | straight through |
+| Same, car starts 10 cm right | 33 | 1 | 6.7 cm / 6.6 cm | straight through |
+| Short 20 cm bar stubs | 31 | 1 | 0.2 cm / 0.6 cm | straight through |
+| Crossing just after a bend | 24 | 1 | 13.8 cm / 13.3 cm | straight through |
+
+Committed exactly once each, at about 50 cm out, no line contact. The two columns
+are the point: holding heading through the crossing leaves the car within half a
+centimetre of the line it would have been on anyway. The 13.8 cm in the last row is
+the racing line running wide out of the bend, not the crossing.
+
 **Camera failure** — **no line contact in any of these**:
 
 | Fault | Result |
@@ -347,6 +437,17 @@ mountings, and that the chicane and racing-line behaviour is real rather than ho
 - A corner tighter than the car's turning circle cannot be driven at any speed. With the
   limits above that is roughly 70 cm radius to the right and 52 cm to the left. The
   firmware fails safe there — it slows and, if it truly cannot see a way through, stops.
+- Intersection detection assumes **flat ground** and needs `CAM_HORIZON_ROW` and
+  `CAM_HEIGHT_CM` to be roughly right (see *Before the first run*). It is the only part
+  of the firmware that is not calibration-free. On a banked or humped track the
+  unprojection is wrong and crossings will be missed.
+- It needs to see the far side of the crossing before it will commit, so a crossing
+  approached with the far edge hidden — over a crest, or with the car so far off line
+  that the far edge is outside the picture — will not be recognised. That fails the
+  right way: the car drives it as ordinary track.
+- The steering holds heading, not position. The car leaves a crossing on the line it
+  entered on, so if it arrives off-centre it stays off-centre until the corridor is
+  believed again on the far side.
 - The build is `-O0`. Moving to `-O2` is free speed in the control loop if you want it,
   but it changes timing, so re-test rather than doing it the night before a race.
 - `RACE_DEBUG` must stay `0` when driving. The debug console is semihosted: with no

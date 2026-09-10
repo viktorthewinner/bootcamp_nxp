@@ -33,6 +33,10 @@
 #define TLM_F_BRAKING   0x10u
 #define TLM_F_RUNNING   0x20u
 #define TLM_F_BENCH     0x40u
+/* Crossing an intersection: the steering came from intersection.c and the
+ * corridor was deliberately not being believed. Frames with this set are the
+ * ones to look at first when a lap goes wrong at a junction. */
+#define TLM_F_ISEC      0x80u
 
 /* Exactly 32 bytes. Fixed point, because floats would double the size for no gain
  * and the host decoder has to know the scaling anyway. */

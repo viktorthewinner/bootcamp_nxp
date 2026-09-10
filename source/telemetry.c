@@ -84,6 +84,10 @@ void Telemetry_Log(const DriveState *st,
     {
         f |= TLM_F_BRAKING;
     }
+    if (st->isec.crossing)
+    {
+        f |= TLM_F_ISEC;
+    }
     if (st->elapsedMs >= START_DELAY_MS)
     {
         f |= TLM_F_RUNNING;

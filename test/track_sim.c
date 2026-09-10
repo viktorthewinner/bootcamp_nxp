@@ -50,6 +50,18 @@ static double g_halfW = 22.5;
  * across the arc - set this to 1 to reproduce that. */
 static int g_maxChunks = 3;
 
+/*
+ * An intersection rendered into the frame. The main track's two edges stop dead
+ * for the width of the crossing track and pick up again on the far side, and four
+ * bars run outward from the four corners that leaves. That is the whole feature:
+ * everything the detector has to work with comes out of this.
+ *
+ * g_isecAt is centimetres along the centre line; negative means no crossing.
+ */
+static double g_isecAt    = -1.0;
+static double g_isecBar   = 40.0; /* how far the crossing edges reach outward, cm */
+static int    g_isecTrace = 0;    /* print every detection, for tuning            */
+
 static void build_centerline(const TrackSeg *segs, int n)
 {
     double x = 0, y = 0, th = 0;
@@ -121,9 +133,40 @@ static bool project(const Cam *c, double fwd, double lat, double *u, double *v)
     return true;
 }
 
+/* Turns one run of image points into up to maxChunks straight vectors, the way the
+ * Pixy2 breaks a curved line into a short chain. */
+static int emit_chunks(const double *ux, const double *vy, int np, int maxChunks,
+                       TrkSegment *out, int maxOut)
+{
+    int nseg = 0, chunks, c;
+
+    if (np < 2 || maxOut < 1) return 0;
+
+    chunks = (np >= 12) ? 3 : ((np >= 6) ? 2 : 1);
+    if (chunks > g_maxChunks) chunks = g_maxChunks;
+    if (chunks > maxChunks)   chunks = maxChunks;
+
+    for (c = 0; c < chunks && nseg < maxOut; c++)
+    {
+        int a = (np - 1) * c / chunks;
+        int b = (np - 1) * (c + 1) / chunks;
+        if (b <= a) continue;
+        out[nseg].x0 = (float)ux[a];
+        out[nseg].y0 = (float)vy[a];
+        out[nseg].x1 = (float)ux[b];
+        out[nseg].y1 = (float)vy[b];
+        nseg++;
+    }
+    return nseg;
+}
+
 /*
- * Renders one track edge into up to 3 segments, the way the Pixy2 breaks a curved
- * line into a small chain of vectors. Points are quantised to integers first.
+ * Renders one track edge into the frame.
+ *
+ * A crossing breaks it in two: the piece the car is following stops at the mouth,
+ * and the same line picks up again on the far side. Both pieces are emitted, and
+ * that is not a detail - the far one is what tells the detector it is looking at a
+ * crossing rather than at an edge that has simply run out of frame.
  */
 static int render_edge(const Cam *cam, double px, double py, double pth, int hint,
                        double side, TrkSegment *out, int maxOut)
@@ -131,6 +174,10 @@ static int render_edge(const Cam *cam, double px, double py, double pth, int hin
     double ux[128], vy[128];
     int    np = 0, nseg = 0;
     int    idx;
+    int    past = 0; /* the near piece has already been emitted */
+
+    int isecLo = (g_isecAt >= 0.0) ? (int)(g_isecAt / g_step) : -1;
+    int isecHi = (g_isecAt >= 0.0) ? (int)((g_isecAt + (2.0 * g_halfW)) / g_step) : -1;
 
     for (idx = hint; idx < g_cn && np < 128; idx += 2)
     {
@@ -144,6 +191,77 @@ static int render_edge(const Cam *cam, double px, double py, double pth, int hin
 
         if (fwd < 1.0) continue;
         if (fwd > 250.0) break;
+
+        /* The edge is not there across the crossing. Close the piece that was
+         * being collected and start a fresh one on the far side. */
+        if ((isecLo >= 0) && (idx >= isecLo) && (idx <= isecHi))
+        {
+            if (np > 0)
+            {
+                nseg += emit_chunks(ux, vy, np, 3, out + nseg, maxOut - nseg);
+                np = 0;
+                past = 1;
+            }
+            continue;
+        }
+
+        if (!project(cam, fwd, lat, &u, &v)) continue;
+
+        u = floor(u + 0.5);
+        v = floor(v + 0.5);
+        if (np > 0 && u == ux[np - 1] && v == vy[np - 1]) continue;
+        ux[np] = u; vy[np] = v; np++;
+    }
+
+    /* The far piece is small and far away, so the camera would report it as one
+     * vector, not a chain. That also keeps the whole frame inside the twelve
+     * vectors the Pixy2 hands over. */
+    nseg += emit_chunks(ux, vy, np, past ? 1 : 3, out + nseg, maxOut - nseg);
+    return nseg;
+}
+
+/*
+ * One edge of the crossing track: a straight line at right angles to ours, running
+ * outward from a corner. Its first point sits exactly where the main edge stopped,
+ * so the two vectors share an endpoint the way the real ones do.
+ */
+/*
+ * A point on the track -> the pixel the camera would report it at, rounded to the
+ * grid. The exact inverse of what intersection.c does to get back out to the
+ * ground, so the geometry cases can be written where the corner really is.
+ */
+static void gproject(double fwd, double lat, float *u, float *v)
+{
+    double d = (PIXY_FOCAL_PX * CAM_HEIGHT_CM) / fwd;
+
+    *v = (float)floor(d + CAM_HORIZON_ROW + 0.5);
+    *u = (float)floor(CAM_CENTER_X - (lat * PIXY_FOCAL_PX / fwd) + 0.5);
+}
+
+static int render_bar(const Cam *cam, double px, double py, double pth, int idx0,
+                      double side, TrkSegment *out, int maxOut)
+{
+    double ux[64], vy[64];
+    int    np = 0, k;
+    double th, cx0, cy0;
+
+    if (maxOut < 1 || idx0 < 0 || idx0 >= g_cn) return 0;
+
+    th  = g_cth[idx0];
+    cx0 = g_cx[idx0];
+    cy0 = g_cy[idx0];
+
+    for (k = 0; k <= 40 && np < 64; k++)
+    {
+        double off = g_halfW + (g_isecBar * (double)k / 40.0);
+        double ex  = cx0 - sin(th) * side * off;
+        double ey  = cy0 + cos(th) * side * off;
+        double dx  = ex - px, dy = ey - py;
+        double fwd = cos(pth) * dx + sin(pth) * dy;
+        double lat = -sin(pth) * dx + cos(pth) * dy;
+        double u, v;
+
+        if (fwd < 1.0) continue;
         if (!project(cam, fwd, lat, &u, &v)) continue;
 
         u = floor(u + 0.5);
@@ -154,24 +272,11 @@ static int render_edge(const Cam *cam, double px, double py, double pth, int hin
 
     if (np < 2) return 0;
 
-    /* Split the point chain into up to 3 straight vectors. */
-    {
-        int chunks = (np >= 12) ? 3 : ((np >= 6) ? 2 : 1);
-        if (chunks > g_maxChunks) chunks = g_maxChunks;
-        int c;
-        for (c = 0; c < chunks && nseg < maxOut; c++)
-        {
-            int a = (np - 1) * c / chunks;
-            int b = (np - 1) * (c + 1) / chunks;
-            if (b <= a) continue;
-            out[nseg].x0 = (float)ux[a];
-            out[nseg].y0 = (float)vy[a];
-            out[nseg].x1 = (float)ux[b];
-            out[nseg].y1 = (float)vy[b];
-            nseg++;
-        }
-    }
-    return nseg;
+    out[0].x0 = (float)ux[0];
+    out[0].y0 = (float)vy[0];
+    out[0].x1 = (float)ux[np - 1];
+    out[0].y1 = (float)vy[np - 1];
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -379,6 +484,10 @@ typedef struct
     double peakHF;
     double peakSev;
     double peakCurv;
+    int    isecSeen;   /* camera frames with a corner detected        */
+    int    isecCross;  /* crossings the car committed to              */
+    double isecFirstS; /* centre line distance of the first commit, cm */
+    double isecPeakLat;/* worst lateral offset while crossing, cm     */
 } Result;
 
 /* Centre line index window for the focused chicane measurement. */
@@ -431,6 +540,7 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
 
     memset(&r, 0, sizeof(r));
     r.name = name;
+    r.isecFirstS = -1.0;
     r.minClear = 1e9;
     r.minSpeed = 1e9;
     r.minSpeedWin = 1e9;
@@ -487,6 +597,25 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
             k = render_edge(cam, sx, sy, sth, sidx, -1.0, allSegs + n,
                             PIXY_MAX_VECTORS - n);
             n = (uint8_t)(n + k);
+
+            /* Four corners: near and far edge of the crossing, left and right. */
+            if (g_isecAt >= 0.0)
+            {
+                int i0 = (int)(g_isecAt / g_step);
+                int i1 = (int)((g_isecAt + (2.0 * g_halfW)) / g_step);
+                int c;
+
+                for (c = 0; c < 4; c++)
+                {
+                    int    at   = (c < 2) ? i0 : i1;
+                    double side = ((c & 1) == 0) ? +1.0 : -1.0;
+
+                    k = render_bar(cam, sx, sy, sth, at, side, allSegs + n,
+                                   PIXY_MAX_VECTORS - n);
+                    n = (uint8_t)(n + k);
+                }
+            }
+
             fresh = true;
 
             /* fault injection */
@@ -510,6 +639,37 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
             if (!st->track.haveTrack) r.lostFrames++;
             else if (!st->track.bothEdges) r.oneEdgeFrames++;
             if (st->line.chicane) r.chicaneFrames++;
+
+            if (st->isec.seen) r.isecSeen++;
+            if ((int)st->isec.count > r.isecCross)
+            {
+                if (r.isecFirstS < 0.0) r.isecFirstS = idx * g_step;
+                r.isecCross = (int)st->isec.count;
+            }
+
+            if ((g_isecTrace == 1 && st->isec.seen) ||
+                (g_isecTrace > 1 && g_isecAt >= 0.0 &&
+                 fabs((idx * g_step) - g_isecAt) < 150.0))
+            {
+                int q;
+                printf("  t=%5.2f s=%6.1f  L=%d R=%d gap=%.0f..%.0f (%.0f cm) "
+                       "edges=%d slope=%+.2f steer=%+5.1f auth=%.2f %s\n",
+                       t, idx * g_step,
+                       st->isec.sawLeft, st->isec.sawRight,
+                       st->isec.gapStartCm, st->isec.gapEndCm, st->isec.gapCm,
+                       st->isec.nEdges, st->isec.slope, st->isec.steer,
+                       st->isec.authority, st->isec.crossing ? "CROSSING" : "");
+                for (q = 0; q < (int)n; q++)
+                    printf("        seg%d (%2.0f,%2.0f)->(%2.0f,%2.0f)\n", q,
+                           allSegs[q].x0, allSegs[q].y0,
+                           allSegs[q].x1, allSegs[q].y1);
+            }
+        }
+
+        if (Driver_State()->isec.crossing)
+        {
+            double al = fabs(lateral_offset(car.x, car.y, idx));
+            if (al > r.isecPeakLat) r.isecPeakLat = al;
         }
 
         /* --- vehicle --- */
@@ -1008,6 +1168,291 @@ int main(int argc, char **argv)
         g_winLo = -1;
         g_winHi = -1;
         return 0;
+    }
+
+    if (argc > 1 && strcmp(argv[1], "-isec") == 0)
+    {
+        int fails = 0;
+
+        if (argc > 2 && strcmp(argv[2], "-v") == 0)  g_isecTrace = 1;
+        if (argc > 2 && strcmp(argv[2], "-vv") == 0) g_isecTrace = 2;
+
+        /* ---------------------------------------------------------------
+         * A. The scan on its own.
+         * A handful of black lines go in, one verdict comes out. No car and no
+         * circuit - this is the gap test and its guards, and nothing else.
+         *
+         * The cases are written where the lines really are, in centimetres ahead
+         * of and to the left of the camera, and then projected into the frame and
+         * rounded to whole pixels the way the Pixy2 would report them.
+         * -------------------------------------------------------------*/
+        printf("=== A. the gap scan ===\n");
+        printf("%-38s %-6s %-6s %-8s %-8s %s\n",
+               "case (45 cm track, camera 18 cm up)",
+               "seen", "side", "gap cm", "steer", "verdict");
+        {
+            /* Each case is up to four ground lines: near edge, far edge, and
+             * whatever else is in the frame. f0/f1 are how far ahead each end is,
+             * l0/l1 how far to the left. */
+            struct Line { double f0, l0, f1, l1; };
+            struct Case
+            {
+                const char *name;
+                struct Line ln[4];
+                int         nLines;
+                int         wantSeen;
+                int         wantSide; /* -1 left, +1 right, 0 either */
+            } cs[] = {
+                { "left edge broken by a crossing",
+                  { { 25.0, 22.5, 100.0, 22.5 }, { 145.0, 22.5, 200.0, 22.5 } },
+                  2, 1, -1 },
+                { "right edge broken by a crossing",
+                  { { 25.0,-22.5, 100.0,-22.5 }, { 145.0,-22.5, 200.0,-22.5 } },
+                  2, 1, +1 },
+                { "both edges broken, with the bars",
+                  { { 25.0, 22.5, 100.0, 22.5 }, { 145.0, 22.5, 200.0, 22.5 },
+                    { 25.0,-22.5, 100.0,-22.5 }, { 145.0,-22.5, 200.0,-22.5 } },
+                  4, 1, 0 },
+                { "car 15 deg off, crossing ahead",
+                  { { 25.0, 15.0, 100.0, 35.0 }, { 145.0, 47.0, 190.0, 59.0 } },
+                  2, 1, -1 },
+                { "edge in three pieces, one crossing",
+                  { { 25.0, 22.5,  60.0, 22.5 }, {  60.0, 22.5, 100.0, 22.5 },
+                    { 145.0, 22.5, 200.0, 22.5 } },
+                  3, 1, -1 },
+
+                /* things that must NOT trigger */
+                { "unbroken edge, no crossing at all",
+                  { { 25.0, 22.5, 200.0, 22.5 }, { 25.0,-22.5, 200.0,-22.5 } },
+                  2, 0, 0 },
+                { "edge just runs out of look-ahead",
+                  { { 25.0, 22.5, 100.0, 22.5 } },
+                  1, 0, 0 },
+                { "10 cm break, camera dropped a bit",
+                  { { 25.0, 22.5, 100.0, 22.5 }, { 110.0, 22.5, 200.0, 22.5 } },
+                  2, 0, 0 },
+                { "140 cm hole, far too big",
+                  { { 25.0, 22.5,  40.0, 22.5 }, { 180.0, 22.5, 200.0, 22.5 } },
+                  2, 0, 0 },
+                { "far piece not parallel",
+                  { { 25.0, 22.5, 100.0, 22.5 }, { 145.0, 22.5, 190.0, 62.0 } },
+                  2, 0, 0 },
+                { "far piece 40 cm out of line",
+                  { { 25.0, 22.5, 100.0, 22.5 }, { 145.0,-17.5, 200.0,-17.5 } },
+                  2, 0, 0 },
+                { "edge starts 100 cm out, none near",
+                  { { 100.0, 22.5, 130.0, 22.5 }, { 170.0, 22.5, 200.0, 22.5 } },
+                  2, 0, 0 },
+                { "only the bars, no edges at all",
+                  { { 100.0, 22.5, 100.0, 62.5 }, { 100.0,-22.5, 100.0,-62.5 } },
+                  2, 0, 0 },
+            };
+            int i;
+
+            for (i = 0; i < (int)(sizeof(cs) / sizeof(cs[0])); i++)
+            {
+                TrkSegment   sg[4];
+                Intersection ix;
+                int          side, ok, q;
+
+                for (q = 0; q < cs[i].nLines; q++)
+                {
+                    gproject(cs[i].ln[q].f0, cs[i].ln[q].l0, &sg[q].x0, &sg[q].y0);
+                    gproject(cs[i].ln[q].f1, cs[i].ln[q].l1, &sg[q].x1, &sg[q].y1);
+                }
+
+                Track_Init();
+                Intersection_Init(&ix);
+                Intersection_Update(sg, (uint8_t)cs[i].nLines, &ix);
+
+                side = ix.seen ? (ix.sawLeft ? -1 : +1) : 0;
+                ok   = ((int)ix.seen == cs[i].wantSeen) &&
+                       ((cs[i].wantSide == 0) || (side == cs[i].wantSide));
+                if (!ok) fails++;
+
+                printf("%-38s %-6s %-6s %-8.0f %+-8.1f %s\n",
+                       cs[i].name,
+                       ix.seen ? "yes" : "no",
+                       ix.seen ? (ix.sawLeft ? (ix.sawRight ? "both" : "left")
+                                             : "right")
+                               : "-",
+                       ix.seen ? ix.gapCm : 0.0,
+                       ix.steer,
+                       ok ? "ok" : "*** WRONG ***");
+            }
+        }
+
+        /* The steering is a heading controller, so check it points the right way:
+         * a track running off to the left ahead has to produce left lock. */
+        {
+            TrkSegment   sg[2];
+            Intersection ix;
+            int          ok;
+
+            gproject(25.0, 15.0, &sg[0].x0, &sg[0].y0);   /* track heads LEFT ahead */
+            gproject(120.0, 45.0, &sg[0].x1, &sg[0].y1);
+            gproject(25.0, -30.0, &sg[1].x0, &sg[1].y0);
+            gproject(120.0,  0.0, &sg[1].x1, &sg[1].y1);
+            Track_Init();
+            Intersection_Init(&ix);
+            Intersection_Update(sg, 2, &ix);
+            ok = (ix.steer < -1.0f);
+            if (!ok) fails++;
+            printf("%-38s %-6s %-6s %-8.2f %+-8.1f %s\n",
+                   "track runs left ahead -> left lock", "-", "-",
+                   ix.slope, ix.steer, ok ? "ok" : "*** WRONG ***");
+
+            gproject(25.0, -15.0, &sg[0].x0, &sg[0].y0);  /* track heads RIGHT ahead */
+            gproject(120.0, -45.0, &sg[0].x1, &sg[0].y1);
+            gproject(25.0,  30.0, &sg[1].x0, &sg[1].y0);
+            gproject(120.0,   0.0, &sg[1].x1, &sg[1].y1);
+            Track_Init();
+            Intersection_Init(&ix);
+            Intersection_Update(sg, 2, &ix);
+            ok = (ix.steer > 1.0f);
+            if (!ok) fails++;
+            printf("%-38s %-6s %-6s %-8.2f %+-8.1f %s\n",
+                   "track runs right ahead -> right lock", "-", "-",
+                   ix.slope, ix.steer, ok ? "ok" : "*** WRONG ***");
+        }
+
+        /* ---------------------------------------------------------------
+         * B. False alarms.
+         * Ordinary circuits with no crossing anywhere on them. One committed
+         * crossing here is one place the car would drive straight on at a corner,
+         * so the only acceptable number is zero.
+         * -------------------------------------------------------------*/
+        printf("\n=== B. false alarms on circuits with no crossing ===\n");
+        printf("%-32s %-8s %-9s %-8s %s\n",
+               "circuit", "frames", "detected", "latched", "verdict");
+        {
+            static const TrackSeg mixed[] = {
+                {0.0, 260.0},
+                {1.0 / 60.0, 60.0 * (M_PI / 2)},
+                {0.0, 120.0},
+                {-1.0 / 85.0, 85.0 * (M_PI / 2)},
+                {0.0, 80.0},
+                {-1.0 / 85.0, 85.0 * (M_PI / 2)},
+                {0.0, 200.0},
+                {1.0 / 80.0, 80.0 * M_PI},
+                {0.0, 140.0},
+                {1.0 / 55.0, 55.0 * (M_PI / 2)},
+                {0.0, 150.0},
+            };
+            static const TrackSeg tight[] = {
+                {0.0, 200.0},
+                {1.0 / 55.0, 55.0 * M_PI},
+                {0.0, 200.0},
+                {-1.0 / 80.0, 80.0 * M_PI},
+                {0.0, 100.0},
+            };
+            static const TrackSeg oval[] = {
+                {0.0, 300.0},
+                {1.0 / 90.0, 90.0 * M_PI},
+                {0.0, 300.0},
+                {-1.0 / 90.0, 90.0 * M_PI},
+                {0.0, 100.0},
+            };
+            static const TrackSeg narrow[] = {
+                {0.0, 250.0},
+                {1.0 / 60.0, 60.0 * M_PI},
+                {0.0, 250.0},
+                {-1.0 / 85.0, 85.0 * M_PI},
+                {0.0, 100.0},
+            };
+            struct { const char *name; const TrackSeg *t; int n; double hw; double lat; } k[] = {
+                { "mixed circuit, off centre", mixed,  11, 22.5, 12.0 },
+                { "tight 180s",                tight,   5, 22.5,  0.0 },
+                { "oval, R=90cm",              oval,    5, 22.5,  0.0 },
+                { "narrow track (35 cm)",      narrow,  5, 17.5,  0.0 },
+            };
+            int i;
+
+            g_isecAt = -1.0;
+            for (i = 0; i < 4; i++)
+            {
+                Result r = run(k[i].t, k[i].n, &cam, k[i].hw, k[i].lat,
+                               k[i].name, 0, 60.0);
+                int bad = (r.isecCross > 0);
+
+                if (bad) fails++;
+                printf("%-32s %-8d %-9d %-8d %s\n", k[i].name, r.steps / 4,
+                       r.isecSeen, r.isecCross,
+                       bad ? "*** FALSE ALARM ***" : "clean");
+            }
+        }
+
+        /* ---------------------------------------------------------------
+         * C. A crossing that is really there.
+         *
+         * The main edges stop for the width of the crossing track and pick up
+         * again on the far side, with four bars run out of the corners it leaves.
+         * The car has to spot the hole, line itself up, and come out the far side
+         * still on its own piece of track.
+         *
+         * Each case is run twice: once with the crossing and once with the same
+         * stretch of track left whole. Without that control there is no telling
+         * whether an offset came from the crossing or from the racing line, which
+         * uses the width of the track on purpose.
+         * -------------------------------------------------------------*/
+        printf("\n=== C. driving through a crossing ===\n");
+        printf("%-34s %-9s %-8s %-9s %-8s %-8s %s\n",
+               "case", "detected", "latched", "at (cm)",
+               "pk|lat|", "no cross", "verdict");
+        {
+            static const TrackSeg straight[] = {
+                {0.0, 200.0},
+                {0.0, 250.0},
+                {0.0, 250.0},
+            };
+            static const TrackSeg afterBend[] = {
+                {0.0, 200.0},
+                {1.0 / 90.0, 90.0 * (M_PI / 3)},
+                {0.0, 300.0},
+                {0.0, 200.0},
+            };
+            struct { const char *name; const TrackSeg *t; int n;
+                     double at; double lat; double bar; } k[] = {
+                { "straight, crossing at 300 cm", straight,  3, 300.0,   0.0, 40.0 },
+                { "same, car starts 10 cm left",  straight,  3, 300.0,  10.0, 40.0 },
+                { "same, car starts 10 cm right", straight,  3, 300.0, -10.0, 40.0 },
+                { "short bars, 20 cm stubs",      straight,  3, 300.0,   0.0, 20.0 },
+                { "crossing just after a bend",   afterBend, 4, 420.0,   0.0, 40.0 },
+            };
+            int i;
+
+            for (i = 0; i < 5; i++)
+            {
+                Result r, ctl;
+                int    bad;
+
+                g_winLo = (int)((k[i].at - 100.0) / g_step);
+                g_winHi = (int)((k[i].at + 100.0) / g_step);
+
+                g_isecAt = -1.0;
+                ctl = run(k[i].t, k[i].n, &cam, 22.5, k[i].lat, k[i].name, 0, 40.0);
+
+                g_isecAt  = k[i].at;
+                g_isecBar = k[i].bar;
+                r = run(k[i].t, k[i].n, &cam, 22.5, k[i].lat, k[i].name, 0, 40.0);
+
+                g_winLo = -1;
+                g_winHi = -1;
+
+                bad = (r.isecCross < 1) || (r.excursions > 0) || !r.finished;
+                if (bad) fails++;
+
+                printf("%-34s %-9d %-8d %-9.0f %-8.1f %-8.1f %s\n", k[i].name,
+                       r.isecSeen, r.isecCross, r.isecFirstS,
+                       r.peakLatWin, ctl.peakLatWin,
+                       bad ? "*** FAILED ***" : "straight through, inside the lines");
+            }
+            g_isecAt  = -1.0;
+            g_isecBar = 40.0;
+        }
+
+        printf("\n%s\n", fails ? "SOME CHECKS FAILED" : "all intersection checks passed");
+        return fails ? 1 : 0;
     }
 
     printf("=== NXP Cup racing firmware - closed loop simulation ===\n");

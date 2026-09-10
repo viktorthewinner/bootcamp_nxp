@@ -34,6 +34,7 @@ CC = os.environ.get("CC", "gcc")
 SRC = [os.path.join(HERE, "track_sim.c"),
        os.path.join(ROOT, "source", "track.c"),
        os.path.join(ROOT, "source", "racing_line.c"),
+       os.path.join(ROOT, "source", "intersection.c"),
        os.path.join(ROOT, "source", "driver.c"),
        os.path.join(ROOT, "source", "speed_ctl.c")]
 

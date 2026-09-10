@@ -53,6 +53,39 @@
  * settles left of centre, lower this number. */
 #define CAM_CENTER_X               39.0f
 
+/* ---------------------------------------------------------------------
+ * Where the camera is.
+ *
+ * The rest of this firmware is deliberately calibration free - it works in image
+ * columns and lets the track model learn its own scale. Intersection detection is
+ * the one part that cannot. What it looks for is a break in a black line about one
+ * track width long, and that is a statement about the track: the same gap is
+ * thirty image rows deep at the bumper and three near the horizon. So the frame is
+ * unprojected onto the ground before anything is measured, and these two numbers
+ * are what makes that possible.
+ *
+ * Getting these two right is ten minutes with a ruler:
+ *
+ *   CAM_HORIZON_ROW  put the car on a long straight and look at the two black
+ *                    lines in the line-tracker view. Extend them until they meet.
+ *                    The row they meet on is this number - negative means the
+ *                    meeting point is above the top of the frame, which it will be
+ *                    on any sanely aimed camera.
+ *
+ *   CAM_HEIGHT_CM    the height of the lens above the track surface.
+ *
+ * Neither has to be exact. Three rows of error in the horizon changes a measured
+ * gap by a few centimetres, well inside the window ISEC_GAP_MIN_CM to
+ * ISEC_GAP_MAX_CM allows. Getting them badly wrong makes the detector miss
+ * crossings rather than invent them, which is the right way round to fail.
+ *
+ * If crossings are being missed on the real car, check these two before touching
+ * anything in the intersection block: a horizon that is several rows out scales
+ * every distance the detector measures.
+ * -------------------------------------------------------------------*/
+#define CAM_HEIGHT_CM              18.0f
+#define CAM_HORIZON_ROW            (-4.0f)
+
 /* Pixy2 I2C address (default 0x54). */
 #define PIXY_I2C_ADDR              0x54U
 
@@ -286,6 +319,156 @@
  * precisely what a driver does. */
 #define CHICANE_DEADBAND           0.08f
 #define CHICANE_DEADBAND_BIG       0.34f
+
+/* =====================================================================
+ * INTERSECTIONS - recognise a crossing by the hole it leaves, and go over it
+ *
+ * See include/intersection.h for the method. These are the numbers.
+ *
+ * A crossing is not detected as a corner. It is detected as a break: the edge the
+ * car is following stops, there is about one track width of white space, and then
+ * the same edge picks up again, parallel to where it left off and in line with it.
+ * The bars across the mouth of the crossing are not used - they are thrown away
+ * with everything else that does not run up the track.
+ *
+ * Everything below that describes a place on the track is in CENTIMETRES on the
+ * ground, because the scan unprojects the frame before it measures anything. The
+ * same gap is thirty image rows deep at the bumper and three near the horizon, so
+ * there is no pixel threshold that means one thing at both ends of the picture.
+ *
+ * Tuning order that works:
+ *   1. CAM_HORIZON_ROW / CAM_HEIGHT_CM above - get these right first. Every
+ *      distance here is measured through them, and if they are wrong nothing else
+ *      in this block will help.
+ *   2. ISEC_GAP_MIN_CM / ISEC_GAP_MAX_CM - the width of the crossing track, with
+ *      room either side. This is the main thing that says yes or no.
+ *   3. ISEC_COMMIT_CM - how late the car commits.
+ *   4. ISEC_HEAD_GAIN - how hard it lines itself up with the track.
+ * ===================================================================*/
+/* Set to 0 and the whole feature compiles out: no detection, no override, and the
+ * car behaves exactly as it did before the module existed. */
+#define ISEC_ENABLE                1
+
+/* An endpoint this close to the horizon is at an unusable distance - a single row
+ * of quantisation moves it by a large fraction of how far away it is - so a vector
+ * with an end up there is dropped rather than unprojected. */
+#define ISEC_MIN_ROWS_BELOW_HZ     6.0f
+
+/* What counts as a line running UP the track rather than across it: it must go at
+ * least this much further away than it goes sideways. This is the test that throws
+ * the crossing bars away, so it does not need to be tight - 1.0 is 45 degrees, and
+ * a bar is nearer 90. */
+#define ISEC_LONG_RATIO            1.00f
+
+/* Shortest edge worth believing, on the ground. The camera splits one black line
+ * into a chain of short vectors and they get shorter the closer the car gets, so
+ * this has to stay small - it is only here to keep single-pixel noise out. What
+ * stops a short vector's wobbly direction mattering is not this number: the scan
+ * merges the chain back into one edge before measuring anything, and the parallel
+ * test picks the longest piece on each side of the hole rather than the nearest. */
+#define ISEC_MIN_EDGE_CM           5.0f
+
+/* How far to one side of the car a line may be and still be part of its own track:
+ * half a track width plus however far off centre the car is. Further out than this
+ * belongs to another part of the circuit and must not be followed. */
+#define ISEC_SIDE_MAX_CM           55.0f
+
+/* The forward scan: how finely it looks and how many bins deep, so ISEC_BINS times
+ * ISEC_BIN_CM is how far ahead it looks. The bin size is what makes overlapping,
+ * abutting and slightly separated vectors all read as one continuous edge, so it
+ * wants to be comfortably bigger than the gap the camera leaves between two pieces
+ * of the same line and comfortably smaller than the crossing. ISEC_BINS is written
+ * as a plain integer because it is an array size in intersection.c; keep it 127 or
+ * less and the scan off the stack. */
+#define ISEC_BIN_CM                5.0f
+#define ISEC_BINS                  40u
+#define ISEC_SCAN_CM               ((float)ISEC_BINS * ISEC_BIN_CM)
+
+/* The near piece has to reach at least this close to the car. An edge that only
+ * appears out in the distance is not one the car is following, and the hole beyond
+ * it says nothing about the track under the wheels. */
+#define ISEC_EDGE_START_MAX_CM     70.0f
+
+/* The white space. A crossing track is as wide as this one, so the hole it leaves
+ * is about one track width - these are that, with room either side for the camera
+ * losing a little of each edge at the mouth. Tighten them if something else on the
+ * circuit is being read as a crossing. */
+#define ISEC_GAP_MIN_CM            25.0f
+#define ISEC_GAP_MAX_CM            95.0f
+
+/*
+ * Require the edge to pick up again on the far side of the hole.
+ *
+ * This is what separates a crossing from an edge that has simply run out - the
+ * camera reaching the end of its look-ahead, or the inside line leaving the side
+ * of the frame in a corner, both of which happen constantly. Leave it on. Turning
+ * it off makes the detector fire on any edge that stops, which on a real circuit
+ * is most of them.
+ */
+#define ISEC_REQUIRE_FAR_EDGE      1
+
+/* How much of the far side of the hole has to be black line. A crossing puts a
+ * whole track's worth of edge over there; a stub that happens to land beyond a gap
+ * is what gets through when the camera calibration is out. */
+#define ISEC_MIN_FAR_CM            15.0f
+
+/* How alike the two pieces have to be to count as the same black line: parallel to
+ * within this much sideways per forward, and in line to within this many
+ * centimetres where the far piece starts. A real crossing is in line to within the
+ * grid quantisation, so these have plenty of room in them. */
+#define ISEC_PARALLEL_TOL          0.30f
+#define ISEC_COLLINEAR_CM          15.0f
+
+/* Frames of agreement before the module is allowed to commit. Counts up on a
+ * detection and down on a miss, so one dropped frame does not undo it. */
+#define ISEC_CONFIRM_FRAMES        2
+
+/* The car commits when the mouth of the crossing is this close. Until then the
+ * module is exactly invisible - it does not touch the steering at all, so on a
+ * circuit with no crossings on it the car drives as if this file did not exist. */
+#define ISEC_COMMIT_CM             60.0f
+
+/* How far past the far side of the hole to keep driving straight, so the back of
+ * the car is out of the crossing before the corridor is believed again. */
+#define ISEC_CLEAR_CM              35.0f
+
+/* The latch distance is measured, not guessed: it is however far the far side of
+ * the hole was, plus ISEC_CLEAR_CM. These only stop a silly measurement buying a
+ * silly amount of blind driving. */
+#define ISEC_CROSS_MIN_M           0.60f
+#define ISEC_CROSS_MAX_M           1.60f
+
+/* After a crossing, detections are ignored for this far. Coming out of one, the
+ * edges behind look exactly like the near side of another. */
+#define ISEC_COOLDOWN_M            0.60f
+
+/* Backstop for a car that is not moving: no ground covered means the distance
+ * budgets above never expire. Neither phase may outlast this. */
+#define ISEC_PHASE_MAX_MS          3000.0f
+
+/*
+ * Lining up with the track.
+ *
+ * The visible edges have a heading relative to the car, measured on the ground,
+ * and this is the gain that nulls it - a plain P controller on "am I parallel".
+ * Holding it means the car leaves the crossing on the line it entered on, which is
+ * what driving straight over one means.
+ *
+ * A slope of 1.0 is 45 degrees off, which nothing survives, so with a gain of 30
+ * and a clamp of 25 the command saturates at about 40 degrees off and is gentle
+ * anywhere near straight.
+ */
+#define ISEC_HEAD_GAIN             30.0f
+#define ISEC_STEER_MAX             25.0f
+
+/* If a frame comes back with nothing running up the track at all, the last command
+ * is faded toward straight ahead by this factor rather than being held. */
+#define ISEC_ALIGN_DECAY           0.75f
+
+/* Speed ceiling while crossing. The car is driving on a latch rather than on what
+ * it can see, so it should not be doing it flat out. Raise to SPEED_MAX to remove
+ * the cap entirely. */
+#define ISEC_SPEED_CAP             85.0f
 
 /* =====================================================================
  * STEERING

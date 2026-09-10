@@ -7,7 +7,9 @@
  *   2. track.c   works out where the two black lines are, at eight distances ahead
  *   3. racing_line.c picks the point to aim at: wide, apex, wide - then forces that
  *                    point back inside the black lines if it has to
- *   4. driver.c  converts it into a servo angle and two motor commands, and decides
+ *   4. intersection.c watches the same vectors for a crossing, and takes the
+ *                steering off the other three to drive straight over one
+ *   5. driver.c  converts it into a servo angle and two motor commands, and decides
  *                how fast the car is allowed to be right now
  *
  * Every number worth changing lives in include/race_config.h.
@@ -60,7 +62,7 @@ static void debug_report(const DriveCmd *cmd)
     }
     next = st->frames + 25u;
 
-    PRINTF("rows=%d both=%d hN=%d hF=%d tgt=%d steer=%d spd=%d sev=%d %s%s\r\n",
+    PRINTF("rows=%d both=%d hN=%d hF=%d tgt=%d steer=%d spd=%d sev=%d %s%s%s\r\n",
            (int)st->track.nValid,
            (int)st->track.bothEdges,
            (int)(st->track.headNear * 100.0f),
@@ -70,6 +72,7 @@ static void debug_report(const DriveCmd *cmd)
            (int)cmd->speed,
            (int)(st->severity * 100.0f),
            st->line.chicane ? "CHICANE " : "",
+           st->isec.crossing ? "CROSSING " : (st->isec.seen ? "corner " : ""),
            cmd->braking ? "BRAKE" : "");
 }
 #endif

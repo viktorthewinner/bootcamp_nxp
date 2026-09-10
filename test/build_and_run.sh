@@ -8,6 +8,7 @@
 #   ./build_and_run.sh              all tests
 #   ./build_and_run.sh -line        the racing line through one corner
 #   ./build_and_run.sh -chicane     small chicane handling
+#   ./build_and_run.sh -isec        intersection detection and crossing
 #   ./build_and_run.sh -fault       camera failure behaviour
 #   ./build_and_run.sh -sweep       robustness over camera mountings
 #   ./build_and_run.sh -v           lap trace
@@ -19,11 +20,12 @@ $CC -O1 -std=gnu99 -o "$OUT" \
     "$HERE/track_sim.c" \
     "$HERE/../source/track.c" \
     "$HERE/../source/racing_line.c" \
+    "$HERE/../source/intersection.c" \
     "$HERE/../source/driver.c" \
     "$HERE/../source/speed_ctl.c" \
     -I"$HERE/../include" -DRACE_BENCH_MODE=0 -lm
 if [ $# -eq 0 ]; then
-    "$OUT"; echo; "$OUT" -line; echo; "$OUT" -chicane; echo; "$OUT" -fault; echo; "$OUT" -sweep
+    "$OUT"; echo; "$OUT" -line; echo; "$OUT" -chicane; echo; "$OUT" -isec; echo; "$OUT" -fault; echo; "$OUT" -sweep
 else
     "$OUT" "$@"
 fi

@@ -22,23 +22,28 @@ static float    s_wB;
 static float    s_widthModel[TRK_ROWS];
 static uint32_t s_frames;
 
+float Track_WidthAtY(float y)
+{
+    float w = (s_wA * y) + s_wB;
+
+    if (w < 6.0f)
+    {
+        w = 6.0f;
+    }
+    if (w > 400.0f)
+    {
+        w = 400.0f;
+    }
+    return w;
+}
+
 static void rebuild_width_model(void)
 {
     uint8_t i;
 
     for (i = 0u; i < TRK_ROWS; i++)
     {
-        float w = (s_wA * (float)s_rowY[i]) + s_wB;
-
-        if (w < 6.0f)
-        {
-            w = 6.0f;
-        }
-        if (w > 400.0f)
-        {
-            w = 400.0f;
-        }
-        s_widthModel[i] = w;
+        s_widthModel[i] = Track_WidthAtY((float)s_rowY[i]);
     }
 }
 
