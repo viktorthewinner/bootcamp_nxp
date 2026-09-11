@@ -18,7 +18,7 @@ import argparse
 
 HDR = "<IHHIII8x"          # magic, version, recordSize, slots, count, uptimeMs, 8 pad
 HDR_SIZE = struct.calcsize(HDR)
-REC = "<HHhhhhhhhhhhBBBBHH"
+REC = "<HHhhhhhhhhhhBBBBBBHH"   # v2 added netClass, netProb
 REC_SIZE = struct.calcsize(REC)
 
 F_HAVETRACK, F_BOTHEDGES, F_CHICANE = 0x01, 0x02, 0x04
@@ -27,7 +27,9 @@ F_ISEC = 0x80
 
 FIELDS = ("frame dtUs steer speed targetX headNear headFar curv bias "
           "widthNear widthFar centerNear nValid nVectors laRow flags "
-          "pixyErrors pixyTimeouts").split()
+          "netClass netProb pixyErrors pixyTimeouts").split()
+
+NET_CLASS = ("straight", "corner", "intersection")
 
 
 def pct(n, d):

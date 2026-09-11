@@ -64,6 +64,14 @@ void Telemetry_Log(const DriveState *st,
     r->nVectors = nVectors;
     r->laRow    = st->line.laRow;
 
+#if CLS_ENABLE
+    r->netClass = (uint8_t)st->net.cls;
+    r->netProb  = (uint8_t)(st->net.prob[st->net.cls] * 255.0f);
+#else
+    r->netClass = 0u;
+    r->netProb  = 0u;
+#endif
+
     if (st->track.haveTrack)
     {
         f |= TLM_F_HAVETRACK;

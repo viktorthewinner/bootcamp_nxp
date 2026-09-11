@@ -32,6 +32,9 @@
 #include "track.h"
 #include "racing_line.h"
 #include "intersection.h"
+#if CLS_ENABLE
+#include "classifier.h"
+#endif
 
 typedef struct
 {
@@ -47,6 +50,11 @@ typedef struct
     TrackModel   track;
     RacingLine   line;
     Intersection isec;
+#if CLS_ENABLE
+    Classifier   net;     /* second opinion on what is ahead - see classifier.h */
+    uint8_t      netHits; /* consecutive confident intersection calls           */
+    uint16_t     netRaises; /* times the classifier changed the crossing verdict */
+#endif
     float      severity;  /* 0 straight, 1 slowest corner  */
     float      steerTgt;
     uint16_t   lostFrames;

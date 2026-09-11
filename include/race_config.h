@@ -1269,4 +1269,89 @@
 #define CAM_RATE_FLOOR             0.35f
 #endif
 
+/* ===================================================================*
+ *  THE CLASSIFIER
+ * ===================================================================*/
+/*
+ * A small network that reads the same vectors as everything else and says
+ * whether the road ahead is straight, a corner, or a junction. See
+ * classifier.h for what it is and features.h for what it is fed.
+ *
+ * It exists for one case in particular. intersection.c finds a crossing by the
+ * hole it leaves - edge stops, white space, edge resumes parallel and in line -
+ * and that signature needs the junction to be more or less square on. Arrive off
+ * the exit of a bend and the camera sees one corner of the mouth at an angle
+ * instead, which is the frame the geometry's own test suite records as "crossing
+ * just after a bend ... no latch needed". The car drives past it.
+ *
+ * CLS_ENABLE 0 removes the whole thing, weights included, and the car behaves
+ * exactly as it did before - same convention as ISEC_ENABLE above.
+ */
+#ifndef CLS_ENABLE
+#define CLS_ENABLE                 1
+#endif
+
+/*
+ * What the car is allowed to DO about the classifier's opinion.
+ *
+ *   0  observe only. The class goes into DriveState and telemetry and nothing
+ *      else reads it. Steering, speed and the crossing latch are untouched.
+ *   1  the classifier may also confirm what intersection.c already suspects,
+ *      which lets a genuine crossing latch a frame or two sooner.
+ *   2  the classifier may raise a crossing on its own, when the geometry has
+ *      seen nothing at all.
+ *
+ * It ships at 0, and that is a deliberate choice rather than caution for its own
+ * sake. Every number in the model came out of the simulator; not one frame of
+ * real track has been through it. The two ways it can be wrong are not
+ * symmetric - a missed crossing means turning down the wrong road, but a crossing
+ * invented in the middle of a real corner means driving straight on at speed into
+ * the black line - and only the second one is created by turning this up.
+ *
+ * Raise it once, on your own track, having watched the telemetry: drive laps with
+ * CLS_ENABLE 1 and this at 0, dump, and look at what the classifier said at the
+ * junctions and, more importantly, at the corners.
+ */
+#ifndef CLS_AUTHORITY
+#define CLS_AUTHORITY              0
+#endif
+
+/*
+ * How sure, and for how many frames running, before the classifier's opinion is
+ * acted on. A crossing lasts tens of frames at 60 fps, so asking for three in a
+ * row costs about 50 ms of the approach and throws away every single frame blip.
+ *
+ * These two are the whole operating point, and `track_sim -mlcheck` prints the
+ * curve they trade along. Measured over 250 circuits the model never trained on:
+ *
+ *     prob  hits    crossings found    circuits with a false one
+ *     0.80     3         94%                     30%
+ *     0.90     3         91%                     20%
+ *     0.98     3         77%                      5%
+ *     0.98     5         66%                      3%
+ *
+ *   for comparison, intersection.c alone:   27%                     11%
+ *
+ * 0.98 is high because a network trained on cross entropy is confident about
+ * nearly everything; it is an operating point, not a probability anyone should
+ * read as one. It is the default because it is the first row that beats the
+ * geometry on BOTH columns at once - more crossings found and fewer invented.
+ * Move it left to catch more, at a cost that lands on the corner you drive
+ * straight through.
+ */
+#ifndef CLS_MIN_PROB
+#define CLS_MIN_PROB               0.98f
+#endif
+#ifndef CLS_MIN_HITS
+#define CLS_MIN_HITS               3u
+#endif
+
+/* How much of the steering a classifier-raised crossing gets, at authority 2.
+ * Deliberately not 1.0: a crossing the geometry agreed with earns full authority
+ * through the normal latch, but one only the network believes in keeps the racing
+ * line in the loop, so a wrong call bends the car rather than taking it over. */
+#ifndef CLS_RAISE_AUTHORITY
+#define CLS_RAISE_AUTHORITY        0.60f
+#endif
+
 #endif /* RACE_CONFIG_H */

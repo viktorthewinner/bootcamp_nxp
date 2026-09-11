@@ -22,6 +22,8 @@
 #include "racing_line.h"
 #include "driver.h"
 #include "race_config.h"
+#include "features.h"
+#include "classifier.h"
 
 #define PIXY_MAX_VECTORS 12
 
@@ -660,6 +662,275 @@ static int    g_profLo = -1, g_profHi = -1;
 static int g_winLo = -1;
 static int g_winHi = -1;
 
+/* ------------------------------------------------------------------ */
+/* Machine learning dataset                                            */
+/*
+ * One row per camera frame: the feature vector features.c builds from that
+ * frame, and the label the circuit generator already knows the answer to.
+ *
+ * There is no bootstrapping problem here and it is worth being clear why. The
+ * label is not a judgement made about a picture - it is read straight out of the
+ * geometry this file used to draw the picture in the first place.
+ * build_centerline() integrates th += g_step * curv, so the curvature at any arc
+ * length is a stored input; xing_add() puts each crossing at a known centimetre
+ * mark. Nobody classifies the first ones. The generator already knows.
+ *
+ * The one real trap is labelling something the frame cannot show. If the camera
+ * can see eighty centimetres and the label says "corner", meaning a bend two
+ * metres away, the model is being trained to predict from evidence that is not
+ * in its input - so it finds a shortcut in the simulator instead, scores well
+ * offline, and falls apart on the car. So the horizon is not a constant here: it
+ * is measured from the rendered frame, every frame.
+ */
+/* ------------------------------------------------------------------ */
+
+enum { ML_STRAIGHT = 0, ML_CORNER = 1, ML_INTERSECTION = 2 };
+
+/*
+ * Where a kink becomes a corner. race_config.h already draws this line for the
+ * speed planner - "dead straight curv ~0.1, 90 cm radius corner curv ~1.5" - and
+ * the label has to land the same way, or the classifier disagrees with driver.c
+ * by construction and the two spend the lap arguing.
+ */
+#define ML_CORNER_RADIUS_CM   150.0
+
+/* Past this the crossing is a couple of pixels at the top of the frame and the
+ * evidence is too thin to call. Inside it, the mouth is genuinely in shot. */
+#define ML_ISEC_MAX_CM        130.0
+/* Still an intersection once the car is in it, until the back axle is clear. */
+#define ML_ISEC_BEHIND_CM     25.0
+
+/* Below this the frame shows a scrap of line and nothing that supports a label. */
+#define ML_MIN_SIGHT_CM       35.0
+
+static FILE     *g_mlFile  = NULL;
+static uint16_t  g_mlTrack = 0;
+static uint16_t  g_mlFrame = 0;
+static long      g_mlRows  = 0;
+static long      g_mlDropped = 0;
+static long      g_mlClass[3] = { 0, 0, 0 };
+
+/* The label for the pose the current frame describes. sightCm is how far ahead
+ * that frame actually shows a line, so the window never outruns the evidence. */
+static int ml_label(int senseIdx, double sightCm)
+{
+    double s         = (double)senseIdx * g_step;
+    double isecAhead = (sightCm < ML_ISEC_MAX_CM) ? sightCm : ML_ISEC_MAX_CM;
+    double sum       = 0.0;
+    int    k, i, steps, cnt = 0;
+
+    for (k = 0; k < g_nXing; k++)
+    {
+        double d      = g_xing[k].at - s;
+        double behind = -((g_xing[k].w * 0.5) + ML_ISEC_BEHIND_CM);
+
+        if (d > behind && d < isecAhead)
+        {
+            return ML_INTERSECTION;
+        }
+    }
+
+    steps = (int)(sightCm / g_step);
+    for (i = senseIdx; (i < senseIdx + steps) && ((i + 1) < g_cn); i++)
+    {
+        sum += fabs(g_cth[i + 1] - g_cth[i]) / g_step;   /* 1/cm */
+        cnt++;
+    }
+    if (cnt == 0)
+    {
+        return ML_STRAIGHT;
+    }
+
+    return ((sum / (double)cnt) > (1.0 / ML_CORNER_RADIUS_CM)) ? ML_CORNER
+                                                              : ML_STRAIGHT;
+}
+
+static void ml_emit(const TrkSegment *segs, uint8_t n, const TrackModel *tm,
+                    int senseIdx)
+{
+    float         feat[FEAT_N];
+    unsigned char hdr[5];
+    double        sightCm;
+    int           label;
+
+    if (g_mlFile == NULL)
+    {
+        return;
+    }
+
+    /*
+     * The centre line is finite and the car is quicker than the time budget
+     * assumes, so it reaches the end and drives on into nothing. Everything past
+     * here is a view of blank floor with a label read off the last centre line
+     * index - fiction, and a lot of it. Stop a clear sight distance short.
+     */
+    if (senseIdx >= (g_cn - (int)(200.0 / g_step)))
+    {
+        return;
+    }
+
+    Features_Build(segs, n, tm, feat);
+
+    /* FEAT_TOP_REACH is the farthest point on any up-track segment, scaled by
+     * 200 cm on the way in. Undo that and it is the sight distance in cm. */
+    sightCm = (double)feat[FEAT_TOP_REACH] * 200.0;
+
+    /*
+     * A frame with nothing usable in it is not a training example, it is a
+     * missing one. The car is blind here - lost, mid packet drop, or pointed at
+     * bare floor - and every label would be a statement about the world that the
+     * input cannot support. Keeping them would teach the most common thing in the
+     * set: "when you can see nothing, say straight". Which is how a classifier
+     * learns to drive confidently into a junction it cannot see.
+     */
+    if (sightCm < ML_MIN_SIGHT_CM || tm->nValid == 0u)
+    {
+        g_mlDropped++;
+        return;
+    }
+
+    label = ml_label(senseIdx, sightCm);
+
+    hdr[0] = (unsigned char)(g_mlTrack & 0xFFu);
+    hdr[1] = (unsigned char)((g_mlTrack >> 8) & 0xFFu);
+    hdr[2] = (unsigned char)(g_mlFrame & 0xFFu);
+    hdr[3] = (unsigned char)((g_mlFrame >> 8) & 0xFFu);
+    hdr[4] = (unsigned char)label;
+
+    (void)fwrite(hdr, 1u, sizeof(hdr), g_mlFile);
+    (void)fwrite(feat, sizeof(float), (size_t)FEAT_N, g_mlFile);
+
+    g_mlFrame++;
+    g_mlRows++;
+    g_mlClass[label]++;
+}
+
+/* ------------------------------------------------------------------ */
+/* Scoring the classifier against the geometry it is meant to help      */
+/* ------------------------------------------------------------------ */
+
+static int  g_chkOn = 0;
+static long g_chkCM[3][3];              /* true class x predicted class      */
+static int  g_chkKind = 0;              /* 0 square on, 1 just past a corner */
+static int  g_chkTrackId = 0;
+static int  g_chkSawTrue, g_chkSawIsec, g_chkSawNet;
+static int  g_chkTracks[2], g_chkFoundIsec[2], g_chkFoundNet[2], g_chkFoundBoth[2];
+
+/*
+ * The dangerous direction, counted separately.
+ *
+ * Missing a crossing means turning down the wrong road. Inventing one in the
+ * middle of a real corner means driving straight on, at speed, into the black
+ * line. Those are not the same mistake, and a report that only counts crossings
+ * found is measuring the half of the problem that cannot hurt the car.
+ *
+ * A "false raise" is what the firmware would actually act on: CLS_MIN_HITS
+ * frames in a row, each at or above CLS_MIN_PROB, on a stretch of track where
+ * there is no crossing at all.
+ */
+static int  g_chkFalseRun;      /* consecutive confident wrong calls, this track */
+static int  g_chkFalseTracks;   /* circuits with at least one such run           */
+static int  g_chkFalseRaises;   /* runs in total                                  */
+static int  g_chkFalseHere;
+static int  g_chkIsecFalseRun, g_chkIsecFalseTracks, g_chkIsecFalseHere;
+
+/*
+ * Every frame's verdict, kept so the operating point can be swept afterwards
+ * without re-driving the circuits. CLS_MIN_PROB and CLS_MIN_HITS are the two
+ * numbers that decide how eager the classifier is, and they trade the same way
+ * every detector does: catch more crossings, invent more of them. Which end of
+ * that trade is right is not something a simulator can settle - it depends on
+ * whether the track has crossings the geometry already handles - so the sweep
+ * prints the curve and leaves the choice where it belongs.
+ */
+#define SW_MAX 400000
+static float    *g_swProb;
+static uint8_t  *g_swTruth;
+static uint16_t *g_swTrack;
+static long      g_swN;
+
+static Classifier g_chkNet;
+
+static void chk_frame(const TrkSegment *segs, uint8_t n, const DriveState *st,
+                      int senseIdx)
+{
+    float  feat[FEAT_N];
+    double sightCm;
+    int    truth, pred;
+
+    if (!g_chkOn)
+    {
+        return;
+    }
+    if (senseIdx >= (g_cn - (int)(200.0 / g_step)))
+    {
+        return;
+    }
+
+    Features_Build(segs, n, &st->track, feat);
+    sightCm = (double)feat[FEAT_TOP_REACH] * 200.0;
+    if (sightCm < ML_MIN_SIGHT_CM || st->track.nValid == 0u)
+    {
+        return;
+    }
+
+    truth = ml_label(senseIdx, sightCm);
+    pred  = (int)Classifier_Step(&g_chkNet, segs, n, &st->track);
+
+    g_chkCM[truth][pred]++;
+
+    if ((g_swProb != NULL) && (g_swN < SW_MAX))
+    {
+        g_swProb[g_swN]  = g_chkNet.prob[CLS_INTERSECTION];
+        g_swTruth[g_swN] = (uint8_t)truth;
+        g_swTrack[g_swN] = (uint16_t)g_chkTrackId;
+        g_swN++;
+    }
+
+    if (truth == ML_INTERSECTION)
+    {
+        g_chkSawTrue++;
+        /* The geometry counts as having seen it if either the per frame
+         * detector fired or the latch is actually running. */
+        if (st->isec.seen || st->isec.crossing) g_chkSawIsec++;
+        if (pred == ML_INTERSECTION)            g_chkSawNet++;
+
+        g_chkFalseRun     = 0;
+        g_chkIsecFalseRun = 0;
+    }
+    else
+    {
+        /* No crossing here. Would the firmware have raised one anyway? */
+        if ((pred == ML_INTERSECTION) &&
+            (g_chkNet.prob[CLS_INTERSECTION] >= CLS_MIN_PROB))
+        {
+            g_chkFalseRun++;
+            if (g_chkFalseRun == (int)CLS_MIN_HITS)
+            {
+                g_chkFalseRaises++;
+                g_chkFalseHere = 1;
+            }
+        }
+        else
+        {
+            g_chkFalseRun = 0;
+        }
+
+        if (st->isec.seen)
+        {
+            g_chkIsecFalseRun++;
+            if (g_chkIsecFalseRun == (int)ISEC_CONFIRM_FRAMES)
+            {
+                g_chkIsecFalseHere = 1;
+            }
+        }
+        else
+        {
+            g_chkIsecFalseRun = 0;
+        }
+    }
+}
+
 static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
                   double startLat, const char *name, int verbose, double maxTime)
 {
@@ -669,6 +940,7 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
     DriveCmd   cmd;
     double     t = 0.0, dt = 0.004; /* 250 Hz control loop */
     int        hint = 0;
+    int        senseIdx = 0;        /* centre line index the latest frame describes */
     int        frameDiv = 0;
     double     lapLen;
     double     servoAngle = 0.0;
@@ -739,6 +1011,7 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
             }
 
             frameDiv = 0;
+            senseIdx = sidx;   /* the frame describes where the car WAS, not where it is */
             k = render_edge(cam, sx, sy, sth, sidx, +1.0, allSegs, 4);
             n = (uint8_t)k;
             k = render_edge(cam, sx, sy, sth, sidx, -1.0, allSegs + n,
@@ -769,6 +1042,12 @@ static Result run(const TrackSeg *segs, int nsegs, const Cam *cam, double halfW,
         if (fresh)
         {
             const DriveState *st = Driver_State();
+
+            /* Post fault injection on purpose: the row records what the car
+             * actually saw this frame, dropped packets and all. */
+            ml_emit(allSegs, n, &st->track, senseIdx);
+            chk_frame(allSegs, n, st, senseIdx);
+
             if (!st->track.haveTrack) r.lostFrames++;
             else if (!st->track.bothEdges) r.oneEdgeFrames++;
             if (st->line.chicane) r.chicaneFrames++;
@@ -993,6 +1272,476 @@ static void dump_motor_map(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Procedural circuits for the dataset                                  */
+/* ------------------------------------------------------------------ */
+
+#define GEN_MAX_SEG 32
+
+/*
+ * Lays out one random circuit and the crossings on it, and picks a camera
+ * mounting to view it through.
+ *
+ * kind 0  a general mixture: straights of every length, bends from 50 cm to
+ *         270 cm radius, chicanes, crossings dropped anywhere along the lap -
+ *         and, three times in ten, no crossing at all, because a classifier
+ *         trained without honest negatives learns to see junctions everywhere.
+ *
+ * kind 1  the case that motivates all of this. The crossing sits a few
+ *         centimetres past the exit of a real corner, so the car is still
+ *         rotating when the junction enters the frame. It never sees the mouth
+ *         square on; it sees one corner of it at an angle, which is the picture
+ *         that makes intersection.c report "crossing just after a bend, no latch
+ *         needed" and drive on.
+ *
+ * The camera mounting is drawn continuously from the same envelope -sweep steps
+ * through discretely, and g_maxChunks is randomised too: at 1 the renderer
+ * chords a whole curve into a single straight vector, which is what the real
+ * Pixy2 does and what the README calls the single worst thing the camera can do.
+ * A model that has only ever seen clean three-chunk curves has not met the
+ * camera it will be racing behind.
+ */
+static int gen_track(TrackSeg *t, int kind, double *halfW, Cam *cam,
+                     double *startLat)
+{
+    int    n = 0, i, nFeat;
+    double s = 0.0;
+    double xAt = -1.0;
+
+    *halfW = 20.0 + grand() * 10.0;
+
+    /*
+     * Draw a mounting, and keep drawing until it is one a car could actually race
+     * behind - the same test -envelope applies, continuous instead of on a grid.
+     *
+     * This is not tidiness. A badly aimed camera puts the car off the track within
+     * a few seconds, and every frame after that is a wheel-in-the-grass view with
+     * nothing to classify. Training on those teaches the model what a crashed car
+     * sees. The mounting still varies over the whole sane range, which is the part
+     * worth being robust to.
+     */
+    for (i = 0; i < 40; i++)
+    {
+        double dNear, dFar, halfViewMid;
+
+        cam->f     = 55.0 + grand() * 25.0;
+        cam->h     = 12.0 + grand() * 14.0;
+        cam->horiz = -10.0 + grand() * 7.0;
+
+        dNear       = cam->f * cam->h / (51.0 - cam->horiz);
+        dFar        = cam->f * cam->h / (0.0 - cam->horiz);
+        halfViewMid = (0.5 * (PIXY_LINE_W - 1)) * cam->h / (26.0 - cam->horiz);
+
+        if (dNear >= 15.0 && dNear <= 35.0 && dFar >= 80.0 && dFar <= 250.0 &&
+            halfViewMid >= *halfW)
+        {
+            break;
+        }
+    }
+
+    *startLat = (grand() - 0.5) * (*halfW) * 0.8;
+
+    {
+        double roll = grand();
+        g_maxChunks = (roll < 0.40) ? 1 : ((roll < 0.70) ? 2 : 3);
+    }
+    g_dropRate = (grand() < 0.5) ? 0.0 : (grand() * 0.06);
+
+    /* An opening straight, so the car is settled before anything happens. */
+    t[n].curv = 0.0;
+    t[n].len  = 100.0 + grand() * 110.0;
+    s += t[n].len;
+    n++;
+
+    nFeat = 4 + (int)(grand() * 6.0);
+
+    for (i = 0; (i < nFeat) && (n < GEN_MAX_SEG - 3); i++)
+    {
+        double roll = grand();
+
+        if (kind == 1 && i == 1)
+        {
+            double R     = 55.0 + grand() * 70.0;
+            double sweep = (M_PI / 3.0) + grand() * (M_PI * 0.7);
+            double sgn   = (grand() < 0.5) ? 1.0 : -1.0;
+
+            t[n].curv = sgn / R;
+            t[n].len  = R * sweep;
+            s += t[n].len;
+            n++;
+
+            /* 5 to 70 cm past the exit. Near the bottom of that range the car is
+             * still turning as the junction appears; near the top it has just
+             * straightened and the mouth is skewed rather than square. */
+            xAt = s + 5.0 + grand() * 65.0;
+
+            t[n].curv = 0.0;
+            t[n].len  = 230.0;
+            s += t[n].len;
+            n++;
+            continue;
+        }
+
+        if (roll < 0.26)
+        {
+            t[n].curv = 0.0;
+            t[n].len  = 50.0 + grand() * 190.0;
+            s += t[n].len;
+            n++;
+        }
+        else if (roll < 0.78)
+        {
+            double R     = 50.0 + grand() * 220.0;
+            double sweep = 0.4 + grand() * (M_PI * 0.9);
+            double sgn   = (grand() < 0.5) ? 1.0 : -1.0;
+
+            t[n].curv = sgn / R;
+            t[n].len  = R * sweep;
+            s += t[n].len;
+            n++;
+        }
+        else
+        {
+            double R   = 90.0 + grand() * 140.0;
+            double sw  = 0.25 + grand() * 0.45;
+            double sgn = (grand() < 0.5) ? 1.0 : -1.0;
+
+            t[n].curv = sgn / R;
+            t[n].len  = R * sw;
+            s += t[n].len;
+            n++;
+            t[n].curv = -sgn / R;
+            t[n].len  = R * sw;
+            s += t[n].len;
+            n++;
+        }
+    }
+
+    t[n].curv = 0.0;
+    t[n].len  = 160.0;
+    s += t[n].len;
+    n++;
+
+    xing_clear();
+    if (kind == 1)
+    {
+        xing_add(xAt, 35.0 + grand() * 20.0, 15.0 + grand() * 30.0,
+                 (grand() < 0.35) ? 0 : 1);
+    }
+    else
+    {
+        double roll = grand();
+
+        if (roll >= 0.30)
+        {
+            double span = (s - 320.0 > 160.0) ? (s - 320.0) : 160.0;
+            int    k, nx = (roll < 0.85) ? 1 : 2;
+
+            for (k = 0; k < nx; k++)
+            {
+                xing_add(160.0 + grand() * span,
+                         35.0 + grand() * 20.0,
+                         15.0 + grand() * 30.0,
+                         (grand() < 0.30) ? 0 : 1);
+            }
+        }
+    }
+
+    return n;
+}
+
+/* Generates the whole dataset and writes it out. */
+static int ml_dataset(const char *path, int nTracks, int nOblique, unsigned seed)
+{
+    TrackSeg t[GEN_MAX_SEG];
+    Cam      cam;
+    unsigned hdr[8];
+    double   halfW, startLat, lenCm;
+    int      i, nsegs, kind;
+    long     rowsAt;
+
+    g_mlFile = fopen(path, "wb");
+    if (g_mlFile == NULL)
+    {
+        fprintf(stderr, "cannot open %s for writing\n", path);
+        return 1;
+    }
+
+    g_genRng = seed;
+
+    hdr[0] = 0x314C4D54u;         /* "TML1" */
+    hdr[1] = 1u;                  /* version                      */
+    hdr[2] = (unsigned)FEAT_N;    /* floats per row               */
+    hdr[3] = (unsigned)FHIST_N;   /* scalars classifier.c stacks  */
+    hdr[4] = 0u;                  /* row count, filled in at the end */
+    hdr[5] = (unsigned)nTracks;
+    hdr[6] = (unsigned)nOblique;
+    hdr[7] = seed;
+    (void)fwrite(hdr, sizeof(unsigned), 8u, g_mlFile);
+
+    printf("generating %d tracks (%d with the crossing just past a corner exit)\n",
+           nTracks, nOblique);
+
+    for (i = 0; i < nTracks; i++)
+    {
+        /* Spread the oblique circuits evenly through the run rather than putting
+         * them in a block: any prefix of the file is then a representative
+         * sample, so a short generation is still a usable experiment. Fires
+         * exactly nOblique times in nTracks. */
+        kind = ((((i + 1) * nOblique) / nTracks) != ((i * nOblique) / nTracks))
+             ? 1 : 0;
+
+        nsegs = gen_track(t, kind, &halfW, &cam, &startLat);
+
+        lenCm = 0.0;
+        {
+            int q;
+            for (q = 0; q < nsegs; q++) lenCm += t[q].len;
+        }
+
+        g_mlTrack = (uint16_t)i;
+        g_mlFrame = 0u;
+
+        (void)run(t, nsegs, &cam, halfW, startLat, "ml", 0,
+                  (lenCm / 150.0) + 2.0);
+
+        if (((i + 1) % 100) == 0)
+        {
+            printf("  %4d/%d tracks   %ld rows\n", i + 1, nTracks, g_mlRows);
+            (void)fflush(stdout);
+        }
+    }
+
+    rowsAt = (long)(sizeof(unsigned) * 4u);
+    if (fseek(g_mlFile, rowsAt, SEEK_SET) == 0)
+    {
+        unsigned rows = (unsigned)g_mlRows;
+        (void)fwrite(&rows, sizeof(unsigned), 1u, g_mlFile);
+    }
+    (void)fclose(g_mlFile);
+    g_mlFile = NULL;
+
+    printf("\n%ld rows, %d features each -> %s\n", g_mlRows, FEAT_N, path);
+    printf("  (%ld frames dropped: camera had nothing to answer from)\n", g_mlDropped);
+    printf("  straight     %8ld  %5.1f%%\n", g_mlClass[ML_STRAIGHT],
+           100.0 * (double)g_mlClass[ML_STRAIGHT] / (double)g_mlRows);
+    printf("  corner       %8ld  %5.1f%%\n", g_mlClass[ML_CORNER],
+           100.0 * (double)g_mlClass[ML_CORNER] / (double)g_mlRows);
+    printf("  intersection %8ld  %5.1f%%\n", g_mlClass[ML_INTERSECTION],
+           100.0 * (double)g_mlClass[ML_INTERSECTION] / (double)g_mlRows);
+
+    return 0;
+}
+
+/*
+ * Runs the trained classifier and intersection.c side by side over circuits
+ * neither has seen, and reports what each of them found.
+ *
+ * The interesting column is the second one. A crossing approached square on is
+ * the case the geometry was designed for and is good at. A crossing just past
+ * the exit of a corner is the case its own test suite records as "crossing just
+ * after a bend ... no latch needed", which is a polite way of saying it drove
+ * past. That is the row worth reading.
+ */
+/*
+ * Replays the recorded per frame probabilities at a range of settings for
+ * CLS_MIN_PROB and CLS_MIN_HITS, and reports what each would have done.
+ *
+ * "found" is a crossing that got the required run of confident frames while one
+ * was genuinely in shot. "false" is a circuit where the same run happened where
+ * there was no crossing at all - which, on the car, is the steering being handed
+ * to a junction that is not there.
+ */
+static void ml_sweep(int nTracks)
+{
+    static const float PROBS[] = { 0.50f, 0.70f, 0.80f, 0.90f, 0.95f, 0.98f };
+    static const int   HITS[]  = { 3, 5, 8 };
+    int   pi, hi;
+
+    if ((g_swProb == NULL) || (g_swN == 0))
+    {
+        return;
+    }
+
+    printf("\noperating points - pick one, then set CLS_MIN_PROB and CLS_MIN_HITS\n");
+    printf("%8s %6s %14s %16s\n", "prob", "hits", "crossings found",
+           "circuits w/ false");
+
+    for (hi = 0; hi < (int)(sizeof(HITS) / sizeof(HITS[0])); hi++)
+    {
+        for (pi = 0; pi < (int)(sizeof(PROBS) / sizeof(PROBS[0])); pi++)
+        {
+            float p    = PROBS[pi];
+            int   need = HITS[hi];
+            long  k;
+            int   run = 0, falseRun = 0;
+            int   found = 0, total = 0, falseTracks = 0;
+            int   sawTrue = 0, hitHere = 0, falseHere = 0;
+            uint16_t cur = g_swTrack[0];
+
+            for (k = 0; k <= g_swN; k++)
+            {
+                bool endOfTrack = (k == g_swN) || (g_swTrack[k] != cur);
+
+                if (endOfTrack)
+                {
+                    if (sawTrue > 0) { total++; if (hitHere) found++; }
+                    if (falseHere) falseTracks++;
+                    run = 0; falseRun = 0; sawTrue = 0; hitHere = 0; falseHere = 0;
+                    if (k == g_swN) break;
+                    cur = g_swTrack[k];
+                }
+
+                if (g_swTruth[k] == (uint8_t)ML_INTERSECTION)
+                {
+                    sawTrue++;
+                    falseRun = 0;
+                    run = (g_swProb[k] >= p) ? (run + 1) : 0;
+                    if (run >= need) hitHere = 1;
+                }
+                else
+                {
+                    run = 0;
+                    falseRun = (g_swProb[k] >= p) ? (falseRun + 1) : 0;
+                    if (falseRun >= need) falseHere = 1;
+                }
+            }
+
+            printf("%8.2f %6d %9d %4.0f%% %11d %4.0f%%\n",
+                   (double)p, need,
+                   found, total ? (100.0 * found / total) : 0.0,
+                   falseTracks, 100.0 * falseTracks / nTracks);
+        }
+        printf("\n");
+    }
+}
+
+static int ml_check(int nTracks, int nOblique, unsigned seed)
+{
+    TrackSeg t[GEN_MAX_SEG];
+    Cam      cam;
+    double   halfW, startLat, lenCm;
+    int      i, q, nsegs, kind;
+    long     tot = 0, right = 0;
+
+    g_genRng = seed;
+    g_chkOn  = 1;
+    (void)memset(g_chkCM, 0, sizeof(g_chkCM));
+    (void)memset(g_chkTracks, 0, sizeof(g_chkTracks));
+    (void)memset(g_chkFoundIsec, 0, sizeof(g_chkFoundIsec));
+    (void)memset(g_chkFoundNet, 0, sizeof(g_chkFoundNet));
+    (void)memset(g_chkFoundBoth, 0, sizeof(g_chkFoundBoth));
+    g_chkFalseTracks = 0;
+    g_chkFalseRaises = 0;
+    g_chkIsecFalseTracks = 0;
+
+    g_swN     = 0;
+    g_swProb  = (float *)malloc(sizeof(float) * SW_MAX);
+    g_swTruth = (uint8_t *)malloc(SW_MAX);
+    g_swTrack = (uint16_t *)malloc(sizeof(uint16_t) * SW_MAX);
+    if ((g_swProb == NULL) || (g_swTruth == NULL) || (g_swTrack == NULL))
+    {
+        free(g_swProb); free(g_swTruth); free(g_swTrack);
+        g_swProb = NULL; g_swTruth = NULL; g_swTrack = NULL;
+    }
+
+    printf("=== classifier vs intersection.c, on %d unseen circuits ===\n\n",
+           nTracks);
+
+    for (i = 0; i < nTracks; i++)
+    {
+        kind = ((((i + 1) * nOblique) / nTracks) != ((i * nOblique) / nTracks))
+             ? 1 : 0;
+
+        nsegs = gen_track(t, kind, &halfW, &cam, &startLat);
+
+        lenCm = 0.0;
+        for (q = 0; q < nsegs; q++) lenCm += t[q].len;
+
+        g_chkKind    = kind;
+        g_chkTrackId = i;
+        g_chkSawTrue = 0;
+        g_chkSawIsec = 0;
+        g_chkSawNet  = 0;
+        g_chkFalseRun = 0;
+        g_chkFalseHere = 0;
+        g_chkIsecFalseRun = 0;
+        g_chkIsecFalseHere = 0;
+        Classifier_Init(&g_chkNet);
+
+        (void)run(t, nsegs, &cam, halfW, startLat, "chk", 0,
+                  (lenCm / 150.0) + 2.0);
+
+        /* Only circuits where a crossing was actually in shot at some point can
+         * say anything about whether it was found. */
+        if (g_chkFalseHere)     g_chkFalseTracks++;
+        if (g_chkIsecFalseHere) g_chkIsecFalseTracks++;
+
+        if (g_chkSawTrue > 0)
+        {
+            g_chkTracks[kind]++;
+            /* Three frames, not one: a single frame agreeing is a coin landing
+             * the right way up, and the latch in intersection.c needs
+             * confirmation before it commits too. */
+            if (g_chkSawIsec >= 3) g_chkFoundIsec[kind]++;
+            if (g_chkSawNet  >= 3) g_chkFoundNet[kind]++;
+            if (g_chkSawIsec >= 3 && g_chkSawNet >= 3) g_chkFoundBoth[kind]++;
+        }
+    }
+
+    g_chkOn = 0;
+
+    printf("per frame, true class down, predicted across\n");
+    printf("%14s %12s %12s %12s %10s\n", "", "straight", "corner",
+           "intersection", "recall");
+    for (i = 0; i < 3; i++)
+    {
+        long rowSum = g_chkCM[i][0] + g_chkCM[i][1] + g_chkCM[i][2];
+
+        printf("%14s %12ld %12ld %12ld %9.1f%%\n",
+               Classifier_Name((ClassId)i),
+               g_chkCM[i][0], g_chkCM[i][1], g_chkCM[i][2],
+               rowSum ? (100.0 * (double)g_chkCM[i][i] / (double)rowSum) : 0.0);
+        tot   += rowSum;
+        right += g_chkCM[i][i];
+    }
+    printf("%14s", "precision");
+    for (i = 0; i < 3; i++)
+    {
+        long colSum = g_chkCM[0][i] + g_chkCM[1][i] + g_chkCM[2][i];
+        printf(" %11.1f%%", colSum ? (100.0 * (double)g_chkCM[i][i] / (double)colSum)
+                                   : 0.0);
+    }
+    printf("\n\n%ld frames, %.1f%% correct overall\n\n",
+           tot, tot ? (100.0 * (double)right / (double)tot) : 0.0);
+
+    printf("crossings found, by how the car arrived at them\n");
+    printf("%-26s %9s %13s %11s %9s\n", "approach", "crossings",
+           "intersection.c", "classifier", "both");
+    for (i = 0; i < 2; i++)
+    {
+        const char *nm = (i == 0) ? "square on" : "just past a corner exit";
+
+        if (g_chkTracks[i] == 0) continue;
+
+        printf("%-26s %9d %8d %4.0f%% %6d %4.0f%% %9d\n", nm, g_chkTracks[i],
+               g_chkFoundIsec[i], 100.0 * g_chkFoundIsec[i] / g_chkTracks[i],
+               g_chkFoundNet[i],  100.0 * g_chkFoundNet[i]  / g_chkTracks[i],
+               g_chkFoundBoth[i]);
+    }
+
+    printf("\ncrossings raised where there was none - the mistake that hurts\n");
+    printf("  classifier      %3d of %d circuits (%.0f%%), %d separate raises\n",
+           g_chkFalseTracks, nTracks, 100.0 * g_chkFalseTracks / nTracks,
+           g_chkFalseRaises);
+    printf("  intersection.c  %3d of %d circuits (%.0f%%)\n",
+           g_chkIsecFalseTracks, nTracks,
+           100.0 * g_chkIsecFalseTracks / nTracks);
+
+    ml_sweep(nTracks);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     Cam cam;
@@ -1002,6 +1751,25 @@ int main(int argc, char **argv)
     {
         dump_motor_map();
         return 0;
+    }
+
+    /* -mlcheck [tracks] [oblique] [seed]
+     * Scores the trained classifier against intersection.c on unseen circuits. */
+    if (argc > 1 && strcmp(argv[1], "-mlcheck") == 0)
+    {
+        return ml_check((argc > 2) ? atoi(argv[2]) : 250,
+                        (argc > 3) ? atoi(argv[3]) : 50,
+                        (argc > 4) ? (unsigned)strtoul(argv[4], NULL, 10) : 90210u);
+    }
+
+    /* -mldata <file> [tracks] [oblique] [seed]
+     * Writes one row per camera frame for the classifier trainer. */
+    if (argc > 2 && strcmp(argv[1], "-mldata") == 0)
+    {
+        return ml_dataset(argv[2],
+                          (argc > 3) ? atoi(argv[3]) : 1000,
+                          (argc > 4) ? atoi(argv[4]) : 200,
+                          (argc > 5) ? (unsigned)strtoul(argv[5], NULL, 10) : 1u);
     }
     int only = -1;
     if (argc > 3 && strcmp(argv[1], "-d") == 0)

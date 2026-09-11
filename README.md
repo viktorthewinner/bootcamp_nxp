@@ -24,11 +24,16 @@ chicane logic, and the speed planner.
 | `source/racing_line.c` | Picks the point to aim at, then forces it back inside the lines |
 | `source/driver.c` | Steering controller + speed planner + brakes + torque vectoring |
 | `source/intersection.c` | Spots a crossing and drives straight over it |
+| `source/features.c` | One camera frame → 48 numbers a classifier can eat |
+| `source/classifier.c` | Small network: straight, corner, or junction ahead |
+| `include/net_weights.h` | **Generated.** The trained weights — do not hand-edit |
 | `source/pixy.c` | Pixy2 line-tracking driver (rewritten — see below) |
 | `source/ticks.c` | Microsecond clock on SysTick, so the loop has a real `dt` |
 | `source/main.c` | Init, then a four-line loop |
 | `test/` | Host simulator that runs the real control code — see *Testing* |
 | `test/robust.py` | Tuning search gated on all sixty track runs, not five |
+| `test/train_classifier.py` | Trains the classifier and writes `net_weights.h` |
+| `test/mldata.py` | Reads the generated training set |
 
 `track.c`, `racing_line.c`, `intersection.c` and `driver.c` have **no SDK dependencies at all**. That is
 deliberate: it is what lets the whole perception and planning chain be compiled and
@@ -641,6 +646,125 @@ mountings, and that the chicane and racing-line behaviour is real rather than ho
 
 ---
 
+## The classifier
+
+A small network that reads the same vectors as everything else and says whether the road
+ahead is **straight**, a **corner**, or a **junction**. It exists for one case.
+
+`intersection.c` finds a crossing by the hole it leaves — the edge stops, there is white
+space about one track width across, the same edge resumes parallel and in line. That
+signature needs the junction to be more or less square on. Arrive off the exit of a bend
+and the camera never sees the mouth; it sees one corner of it at an angle, two long
+vectors meeting at something near a right angle. The geometry's own test suite records
+what happens next as *"crossing just after a bend … no latch needed"*, which is a polite
+way of saying the car drove past it.
+
+### What it costs
+
+| | |
+|---|---|
+| Network | 72 → 32 → 16 → 3, 2,864 MACs, 2,915 parameters |
+| Flash | **15.8 KB** on the M33 (11.4 KB of that is the weights) |
+| Stack | 576 B in `Classifier_Step`, 768 B under it in `Features_Build` |
+| Time | **~27 µs** per frame, of the 16.7 ms a 60 fps camera gives you |
+
+fp32 throughout, no quantisation and no NPU. The compiler emits one `vfma.f32` per weight
+on the FPv5 unit, so the MAC count *is* the cycle count. An int8 build would need SIMD
+intrinsics to be any quicker, and the thing it would be making quicker already costs
+0.16% of the budget. The MCX N947 *does* have an eIQ Neutron NPU; using it here would be
+real integration work to save 20 µs.
+
+### How it was trained
+
+`track_sim.c` generates the circuits and already knows the answer — `build_centerline()`
+integrates `th += g_step * curv`, so curvature at any arc length is a stored input, and
+`xing_add()` puts each crossing at a known centimetre mark. Nobody labels the first ones.
+
+```bash
+./test/build_and_run.sh -mldata train.bin 1000 200 1
+```
+
+1,000 circuits, 200 of them with the crossing **just past a corner exit**. Camera
+mounting drawn continuously from the sane envelope, `g_maxChunks` randomised so 40% of
+frames have curves chorded into one long vector the way the real Pixy2 does it, packet
+drops injected. 476k frames survive; the rest are dropped because the camera had nothing
+to answer from, and labelling those would teach the model to say *straight* whenever it
+is blind.
+
+The label horizon is not a constant — it is measured from the rendered frame, every
+frame. Label a corner two metres out when the camera can see eighty centimetres and the
+model learns a shortcut in the simulator, scores well offline and falls apart on the car.
+
+```bash
+python test/train_classifier.py train.bin val.bin include/net_weights.h
+```
+
+Validation is a *different generator seed*, so no layout, mounting or crossing position
+is shared. Splitting rows at random would leak badly — consecutive frames of one lap are
+nearly the same picture.
+
+### What it is worth
+
+`./test/build_and_run.sh -mlcheck 250 50 90210`, over 250 circuits it never trained on:
+
+| approach | crossings | `intersection.c` | classifier |
+|---|---|---|---|
+| square on | 101 | 26% | **97%** |
+| just past a corner exit | 36 | 28% | **100%** |
+
+and the mistake that actually hurts — a crossing raised where there is none, which on the
+car means driving straight on into a real corner:
+
+| | circuits affected |
+|---|---|
+| classifier, at the shipped `CLS_MIN_PROB` | **5%** |
+| `intersection.c` | 11% |
+
+`-mlcheck` prints the whole operating-point curve for `CLS_MIN_PROB` and `CLS_MIN_HITS`.
+0.98 is the default because it is the first row that beats the geometry on *both* columns
+at once. Move it left to catch more crossings; the cost lands on the corner you drive
+straight through.
+
+### It is switched off
+
+`CLS_AUTHORITY` ships at **0** — observe only. The class and its confidence go into
+`DriveState` and into every telemetry record, and nothing else reads them. Verified: with
+`CLS_AUTHORITY 0` the whole test suite is byte-identical to a build with `CLS_ENABLE 0`.
+
+That is a deliberate choice, not caution for its own sake. **Every number in the model
+came out of the simulator. Not one frame of real track has been through it.** The two
+ways it can be wrong are not symmetric, and only the dangerous one is created by turning
+this up.
+
+So: drive laps with `CLS_ENABLE 1` and `CLS_AUTHORITY 0`, dump the log, and look at what
+it said at the junctions and — more importantly — at the corners. `netClass` and `netProb`
+are in every record. Then decide.
+
+- **1** lets it confirm what `intersection.c` already suspects, so a genuine crossing
+  latches a frame or two sooner. It cannot create one: `isec.seen` must still be true and
+  every measurement the latch runs on is still the geometry's.
+- **2** lets it act when the geometry saw nothing — the oblique case. Even then it does
+  not latch a crossing or invent a distance to run for, because the gap was never
+  measured. It hands partial authority to the hold-parallel steer `intersection.c`
+  already computed from the edges that *are* visible.
+
+  **Measured, it does not currently help, and slightly hurts.** On `-tracks` part 2:
+
+  | | crossings clean | not recognised | off the track | total time |
+  |---|---|---|---|---|
+  | `CLS_AUTHORITY 0` | 6 / 36 | 17 | 13 | 666.8 s |
+  | `CLS_AUTHORITY 1` | 6 / 36 | 17 | 13 | 666.8 s |
+  | `CLS_AUTHORITY 2` | **5 / 36** | 18 | 13 | **746.8 s** |
+
+  The reason is worth understanding before trying again: `ix->steer` nulls the *edge
+  slope*, which means "drive straight". In a corner that is exactly the wrong command,
+  so a false intersection call there points the car at the outside line — and this suite
+  is twelve corner-heavy layouts, which is where the classifier's remaining false
+  positives live. Getting value out of level 2 needs a better intervention than
+  borrowing a steering command built for a different situation, not a better threshold.
+
+---
+
 ## Known limitations
 
 - **`STEER_LIMIT_RIGHT = 45` vs `STEER_LIMIT_LEFT = -60`** is inherited from the original
@@ -652,7 +776,24 @@ mountings, and that the chicane and racing-line behaviour is real rather than ho
 - Intersection detection assumes **flat ground** and needs `CAM_HORIZON_ROW` and
   `CAM_HEIGHT_CM` to be roughly right (see *Before the first run*). It is the only part
   of the firmware that is not calibration-free. On a banked or humped track the
-  unprojection is wrong and crossings will be missed.
+  unprojection is wrong and crossings will be missed. The classifier inherits this: its
+  ground-plane features go through the same unprojection.
+- The classifier has **only ever seen simulated frames**. Every figure quoted for it is
+  measured against the same generator that produced its training set — different
+  circuits, but the same renderer, the same noise model, the same idea of what a crossing
+  looks like. `intersection.c` was tuned by hand on a different and cleaner set of cases,
+  so the comparison above flatters the network somewhat. Treat those numbers as evidence
+  that the approach works, not as a prediction of what it will do on your track.
+- The classifier's value is demonstrated in **detection only**. Wiring that detection to
+  the steering has been tried and measured, and at `CLS_AUTHORITY 2` it makes `-tracks`
+  part 2 marginally worse, not better (see *The classifier*). Knowing a junction is there
+  and knowing what to do about it are separate problems, and only the first one is solved.
+- **`-tracks` part 2 is where this firmware is weakest, with or without the classifier.**
+  36 crossings across 12 layouts: 6 clean, 17 not recognised, 13 left the track. The
+  pattern is stark — a crossing placed *at a corner exit* fails on almost every layout,
+  while the same crossing 25–75 cm further on is usually driven cleanly. This is
+  pre-existing and unrelated to anything above; the numbers are identical with
+  `CLS_ENABLE 0`. It is the most valuable thing in this file to fix next.
 - As shipped it needs to see the far side of the crossing before it will commit, so
   a crossing the car is already sitting in — where the far edges are a couple of
   pixels at the top of the frame and the camera has stopped reporting them — is not

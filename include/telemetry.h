@@ -22,8 +22,12 @@
 #include "driver.h"
 
 #define TLM_MAGIC       0x314D4C54u /* "TLM1" */
-#define TLM_VERSION     1u
-#define TLM_SLOTS       3000u       /* 32 B each: ~96 KB, about 50 s at 60 fps */
+#define TLM_VERSION     2u   /* 2 added the classifier verdict to each record */
+#define TLM_SLOTS       2880u       /* 34 B each: ~96 KB, about 48 s at 60 fps.
+                                     * Two frames of the buffer bought the
+                                     * classifier's verdict, which is the only
+                                     * way to find out on a real track whether
+                                     * it deserves CLS_AUTHORITY above zero. */
 
 /* flags bits */
 #define TLM_F_HAVETRACK 0x01u
@@ -38,7 +42,7 @@
  * ones to look at first when a lap goes wrong at a junction. */
 #define TLM_F_ISEC      0x80u
 
-/* Exactly 32 bytes. Fixed point, because floats would double the size for no gain
+/* Exactly 34 bytes. Fixed point, because floats would double the size for no gain
  * and the host decoder has to know the scaling anyway. */
 typedef struct
 {
@@ -58,6 +62,11 @@ typedef struct
     uint8_t  nVectors;      /* raw vectors the Pixy2 returned this frame */
     uint8_t  laRow;
     uint8_t  flags;
+    /* What the classifier made of this frame. netProb is its confidence in the
+     * class it picked, 0..255, so the log shows not just what it said but how
+     * sure it was - which is what you need to choose CLS_MIN_PROB. */
+    uint8_t  netClass;      /* 0 straight, 1 corner, 2 intersection */
+    uint8_t  netProb;
     uint16_t pixyErrors;
     uint16_t pixyTimeouts;
 } TlmRecord;

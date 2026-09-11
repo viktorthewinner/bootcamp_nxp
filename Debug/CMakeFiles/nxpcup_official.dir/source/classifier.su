@@ -1,0 +1,4 @@
+C:/Users/victo/Desktop/git version/bootcamp_nxp/source/classifier.c:37:13:dense	40	static
+C:/Users/victo/Desktop/git version/bootcamp_nxp/source/classifier.c:60:6:Classifier_Init	16	static
+C:/Users/victo/Desktop/git version/bootcamp_nxp/source/classifier.c:67:9:Classifier_Step	576	static
+C:/Users/victo/Desktop/git version/bootcamp_nxp/source/classifier.c:163:13:Classifier_Name	16	static

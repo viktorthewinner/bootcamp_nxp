@@ -95,6 +95,11 @@ void Driver_Init(void)
     RL_Init();
     SpeedCtl_Init();
     Intersection_Init(&s_st.isec);
+#if CLS_ENABLE
+    Classifier_Init(&s_st.net);
+    s_st.netHits = 0u;
+    s_st.netRaises = 0u;
+#endif
 
     s_steer      = 0.0f;
     s_steerTgt   = 0.0f;
@@ -391,6 +396,74 @@ static void plan_intersection(void)
     s_st.steerTgt = s_steerTgt;
 }
 
+#if CLS_ENABLE && (CLS_AUTHORITY > 0)
+/*
+ * What the classifier is allowed to do about a crossing, and nothing more.
+ *
+ * Runs after Intersection_Update and before plan_intersection, so it adjusts a
+ * decision that has been made from the geometry and is then acted on once.
+ *
+ * AUTHORITY 1 - agreeing with the geometry
+ *
+ *   Both saw it, so bring the confirmation count forward. This does not create a
+ *   crossing: st->seen still has to be true, and the mouth still has to be inside
+ *   ISEC_COMMIT_CM, so every measurement the latch runs on is the geometry's. All
+ *   it buys is the frame or two of approach that ISEC_CONFIRM_FRAMES costs, which
+ *   at 3 m/s is about ten centimetres of track.
+ *
+ * AUTHORITY 2 - the case this whole thing exists for
+ *
+ *   The geometry saw no crossing and the network is sure there is one. That is
+ *   the oblique approach: the mouth is not square on, so there is no hole with
+ *   parallel sides to find, and intersection.c reports nothing.
+ *
+ *   Note what is NOT done here. No crossing is latched, no distance budget is
+ *   invented, and nothing is committed to blind. There is no honest way to do
+ *   any of that - the gap was never measured, so there is no distance to run for.
+ *
+ *   What is done instead is the small, real thing: intersection.c has already
+ *   computed a steering command from the edges it can still see, whether or not
+ *   it recognised a crossing, and that command holds the car parallel to them.
+ *   Handing it partial authority stops the racing line steering into the opening
+ *   corridor, which is the actual failure - the corridor widens at a junction,
+ *   the aim point follows it, and the car turns down the crossing road.
+ */
+static void arbitrate_classifier(void)
+{
+    Intersection *ix = &s_st.isec;
+
+    if (s_st.netHits < CLS_MIN_HITS)
+    {
+        return;
+    }
+    if (ix->phase != ISEC_IDLE)
+    {
+        return;   /* committed, or in the cooldown that exists to be respected */
+    }
+
+    if (ix->seen)
+    {
+        if (ix->hits < (uint8_t)ISEC_CONFIRM_FRAMES)
+        {
+            ix->hits = (uint8_t)ISEC_CONFIRM_FRAMES;
+            s_st.netRaises++;
+        }
+        return;
+    }
+
+#if CLS_AUTHORITY >= 2
+    /* Only when there is a real edge to hold parallel to. With nothing running
+     * up the track, ix->steer is decaying toward straight ahead and giving it
+     * authority would just be driving blind on a hunch. */
+    if ((ix->nEdges > 0u) && (ix->authority < CLS_RAISE_AUTHORITY))
+    {
+        ix->authority = CLS_RAISE_AUTHORITY;
+        s_st.netRaises++;
+    }
+#endif
+}
+#endif /* CLS_ENABLE && CLS_AUTHORITY */
+
 #endif /* ISEC_ENABLE */
 
 /* ---- main step ---------------------------------------------------------- */
@@ -450,6 +523,34 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
             }
 #endif
 
+#if CLS_ENABLE
+            /*
+             * Same raw vectors, same reason, and after Track_Update for the same
+             * reason again - features.c reads the corridor this frame produced
+             * and unprojects through the mounting the width model has learned.
+             *
+             * This runs whatever CLS_AUTHORITY is set to. At 0 nothing below
+             * reads the answer, but it still reaches DriveState and the telemetry
+             * log, which is the whole point of shipping it switched off: you
+             * cannot decide whether to trust it without a few laps of it being
+             * recorded while it drives nothing.
+             */
+            Classifier_Step(&s_st.net, segs, n, &s_st.track);
+
+            if ((s_st.net.cls == CLS_INTERSECTION) &&
+                (s_st.net.prob[CLS_INTERSECTION] >= CLS_MIN_PROB))
+            {
+                if (s_st.netHits < 255u)
+                {
+                    s_st.netHits++;
+                }
+            }
+            else
+            {
+                s_st.netHits = 0u;   /* consecutive, not cumulative */
+            }
+#endif
+
             if (trackOk)
             {
                 s_st.lostFrames = 0u;
@@ -473,6 +574,9 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
              * one case where a missing corridor is no obstacle at all. */
             if (running)
             {
+#if CLS_ENABLE && (CLS_AUTHORITY > 0)
+                arbitrate_classifier();
+#endif
                 plan_intersection();
             }
 #endif

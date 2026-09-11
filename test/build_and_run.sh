@@ -14,6 +14,13 @@
 #   ./build_and_run.sh -fault       camera failure behaviour
 #   ./build_and_run.sh -sweep       robustness over camera mountings
 #   ./build_and_run.sh -v           lap trace
+#
+# and, for the classifier:
+#
+#   ./build_and_run.sh -mldata F N K   write a training set: N circuits, K of
+#                                      them with the crossing just past a corner
+#   ./build_and_run.sh -mlcheck N K S  score the trained model against
+#                                      intersection.c on N unseen circuits
 set -e
 CC=${CC:-gcc}
 HERE=$(dirname "$0")
@@ -25,6 +32,8 @@ $CC -O1 -std=gnu99 -o "$OUT" \
     "$HERE/../source/intersection.c" \
     "$HERE/../source/driver.c" \
     "$HERE/../source/speed_ctl.c" \
+    "$HERE/../source/features.c" \
+    "$HERE/../source/classifier.c" \
     -I"$HERE/../include" -DRACE_BENCH_MODE=0 -lm
 if [ $# -eq 0 ]; then
     "$OUT"; echo; "$OUT" -line; echo; "$OUT" -chicane; echo; "$OUT" -isec; echo; "$OUT" -tracks; echo; "$OUT" -fault; echo; "$OUT" -sweep
