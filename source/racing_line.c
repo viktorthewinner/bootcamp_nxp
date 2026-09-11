@@ -150,6 +150,10 @@ void RL_Compute(const TrackModel *m, float speedFrac, RacingLine *out)
      * scaled back by the same confidence. */
     bias *= conf;
 
+#if !LINE_RACING_ENABLE
+    bias = 0.0f; /* middle of the lane, always */
+#endif
+
     s_bias += LINE_BIAS_ALPHA * (bias - s_bias);
     s_bias = clampf(s_bias, -1.0f, 1.0f);
 

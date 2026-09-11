@@ -48,6 +48,7 @@ typedef struct
     uint32_t   frames;
     float      elapsedMs;
     bool       exiting;
+    bool       crossing;  /* driving straight through an intersection */
 } DriveState;
 
 void Driver_Init(void);

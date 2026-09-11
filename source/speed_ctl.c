@@ -1,8 +1,11 @@
 #include "speed_ctl.h"
+#include <math.h>
 #include "race_config.h"
 
 static SpeedState s;
 static float      s_vRefPrev;
+static float      s_vBrakeFrom; /* speed the current braking event started at */
+static float      s_vBrakeTo;   /* speed it is heading for                    */
 
 /*
  * Steady-state speed in m/s at duty 0, 10, 20 ... 100 percent, from
@@ -95,7 +98,11 @@ void SpeedCtl_Init(void)
     s.duty      = 0.0f;
     s.integ     = 0.0f;
     s.measured  = false;
+    s.braking   = false;
+    s.brakeProg = 1.0f;
     s_vRefPrev  = 0.0f;
+    s_vBrakeFrom = 0.0f;
+    s_vBrakeTo   = 0.0f;
 }
 
 const SpeedState *SpeedCtl_State(void)
@@ -133,8 +140,26 @@ float SpeedCtl_SpeedFrac(void)
 float SpeedCtl_Step(float vTargetUnits, float dt, bool allowBrake, float accelMs2)
 {
     float vTarget, dv, dvdt, duty, accLim, decLim;
+    float decMs2, brakeCap;
 
     dt = clampf(dt, 1.0e-4f, 0.2f);
+
+    /*
+     * How hard may the car brake right now. A power curve of how fast it is
+     * going: gentle when slow, the full values at 100%, and with the exponent
+     * at 2 it tracks kinetic energy - the thing the brake actually has to
+     * get rid of.
+     */
+    {
+        float hard = clampf((SpeedCtl_SpeedFrac() - SPEED_BRAKE_RAMP_FROM) /
+                                (1.0f - SPEED_BRAKE_RAMP_FROM),
+                            0.0f, 1.0f);
+
+        hard = powf(hard, SPEED_BRAKE_EXP);
+
+        decMs2   = SPEED_DEC_MS2 + ((SPEED_DEC_FULL_MS2 - SPEED_DEC_MS2) * hard);
+        brakeCap = SPEED_BRAKE_DUTY_MAX + ((SPEED_BRAKE_DUTY_FULL - SPEED_BRAKE_DUTY_MAX) * hard);
+    }
 
     vTarget     = clampf(vTargetUnits, 0.0f, 100.0f) * (0.01f * SPEED_TOP_MS);
     s.vTargetMs = vTarget;
@@ -147,7 +172,7 @@ float SpeedCtl_Step(float vTargetUnits, float dt, bool allowBrake, float accelMs
      * a real acceleration request.
      */
     accLim = ((accelMs2 > 0.0f) ? accelMs2 : SPEED_ACC_MS2) * dt;
-    decLim = (allowBrake ? SPEED_DEC_MS2 : SPEED_COAST_MS2) * dt;
+    decLim = (allowBrake ? decMs2 : SPEED_COAST_MS2) * dt;
 
     dv = vTarget - s.vRefMs;
     if (dv > accLim)
@@ -172,6 +197,42 @@ float SpeedCtl_Step(float vTargetUnits, float dt, bool allowBrake, float accelMs
     s_vRefPrev = s.vRefMs;
 
     /*
+     * Where are we in the braking event. A braking event starts when the
+     * reference has to come down to meet a lower target and ends when it gets
+     * there (or the target climbs back above it). Progress runs 0 -> 1 over
+     * the speed still to be shed, which is what the steering uses to feed the
+     * lock in gradually and have all of it by the moment braking ends.
+     */
+    if (allowBrake && (vTarget < (s.vRefMs - 0.02f)))
+    {
+        if (!s.braking)
+        {
+            s.braking    = true;
+            s_vBrakeFrom = s.vRefMs;
+            s_vBrakeTo   = vTarget;
+        }
+        else if (vTarget < s_vBrakeTo)
+        {
+            s_vBrakeTo = vTarget; /* target dropped further mid-brake: longer event */
+        }
+        else
+        {
+            /* same event, same destination */
+        }
+
+        {
+            float span = s_vBrakeFrom - s_vBrakeTo;
+
+            s.brakeProg = (span > 0.02f) ? clampf((s_vBrakeFrom - s.vRefMs) / span, 0.0f, 1.0f) : 1.0f;
+        }
+    }
+    else
+    {
+        s.braking   = false;
+        s.brakeProg = 1.0f;
+    }
+
+    /*
      * Feedforward. The static part inverts the measured duty->speed map, so the
      * request comes out as the duty that really produces it. The dynamic part
      * inverts the 348 ms pole: to make speed follow a ramp, the winding needs
@@ -191,7 +252,7 @@ float SpeedCtl_Step(float vTargetUnits, float dt, bool allowBrake, float accelMs
     {
         float e   = s.vRefMs - s.vEstMs;
         float un  = duty + (SPEED_KP * e) + (SPEED_KI * s.integ);
-        float sat = clampf(un, allowBrake ? -100.0f : 0.0f, 100.0f);
+        float sat = clampf(un, allowBrake ? -brakeCap : 0.0f, 100.0f);
 
         /* Conditional integration. Back-calculating instead throws the
          * accumulated value away every time the loop leaves a stop, and the car
@@ -206,7 +267,7 @@ float SpeedCtl_Step(float vTargetUnits, float dt, bool allowBrake, float accelMs
     }
 #endif
 
-    duty = clampf(duty, allowBrake ? -100.0f : 0.0f, 100.0f);
+    duty = clampf(duty, allowBrake ? -brakeCap : 0.0f, 100.0f);
     s.duty = duty;
 
     /*

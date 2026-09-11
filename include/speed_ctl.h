@@ -44,6 +44,8 @@ typedef struct
     float duty;      /* what went to the bridge, percent                     */
     float integ;     /* integral state, only used with feedback              */
     bool  measured;  /* true when vEstMs came from a sensor, not the model   */
+    bool  braking;   /* a braking event is in progress                      */
+    float brakeProg; /* 0 = braking just started, 1 = finished or not braking */
 } SpeedState;
 
 void SpeedCtl_Init(void);

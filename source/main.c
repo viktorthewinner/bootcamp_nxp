@@ -70,6 +70,7 @@ static void debug_report(const DriveCmd *cmd)
            (int)cmd->speed,
            (int)(st->severity * 100.0f),
            st->line.chicane ? "CHICANE " : "",
+           st->crossing ? "XING " : "",
            cmd->braking ? "BRAKE" : "");
 }
 #endif

@@ -183,6 +183,13 @@
  * RACING LINE - outside, inside, outside
  * Bias is a fraction of the usable half-corridor. + = toward the right edge.
  * ===================================================================*/
+/* 0 switches the racing line off: the car aims at the middle of the corridor
+ * everywhere, corners included. The safety margins, look-ahead and chicane
+ * handling all keep working, only the outside-inside-outside sweep is gone. */
+#ifndef LINE_RACING_ENABLE
+#define LINE_RACING_ENABLE         0
+#endif
+
 #ifndef LINE_APEX_BIAS
 #define LINE_APEX_BIAS             0.85f
 #endif   /* dive to the inside at the apex     */
@@ -311,6 +318,31 @@
 #define STEER_KP                   78.0f
 #define STEER_KH                   30.0f
 #define STEER_KD                   4.0f
+
+/* Corner exit: the road ahead has gone straight but the car has not yet - it is
+ * still pointing across the track at the angle it came out of the apex with. The
+ * heading term is what squares the car up, so it gets this much extra while the
+ * exit lasts. 1.0 is off. Too much and the car overshoots straight and has to
+ * correct back, which shows up as a wiggle at the start of every straight. */
+#define STEER_EXIT_HEAD_BOOST      1.40f
+
+/* Extra steering in corners, on top of everything the controller asks for.
+ * 1.05 is 5% more lock; scaled by cornerness, so a straight or a small chicane
+ * gets none of it and a proper corner gets all of it. */
+#define STEER_CORNER_GAIN          1.05f
+
+/* And more again when the car is at full speed. Blends in from
+ * STEER_FULLSPEED_FROM of full speed to all of it at 100%. */
+#define STEER_FULLSPEED_FROM       0.85f
+#define STEER_FULLSPEED_GAIN       1.05f
+
+/* Trail braking. While the car is shedding speed for a corner the lock is fed in
+ * with the braking, not all at once: at the start of the braking event only this
+ * fraction of the angle the controller wants is applied, rising linearly to the
+ * whole of it at the moment braking ends. Turning in hard with the brakes full
+ * on is what unsettles the car; this way the most steering arrives when the
+ * least brake is left. 1.0 switches it off. */
+#define STEER_BRAKE_START_FRAC     0.55f
 
 /* =====================================================================
  * GEOMETRIC STEERING (pure pursuit)
@@ -464,7 +496,7 @@
  * On a 45 cm track only the last one is safe, and even that clears by 3 mm.
  */
 #ifndef SPEED_MIN
-#define SPEED_MIN                  76.0f
+#define SPEED_MIN                  70.0f
 #endif
 
 /* Global scale, handy for a quick trackside calm-down. 1.0 = full. */
@@ -567,8 +599,27 @@
 #define SPEED_ACC_MS2              3.00f
 #define SPEED_ACC_EXIT_MS2         6.00f  /* corner exit: let the reference run
                                            * ahead so the duty pins at 100% */
-#define SPEED_DEC_MS2              6.00f
+#define SPEED_DEC_MS2              3.70f  /* gentle: a little above coasting, so the
+                                           * car eases off rather than stabbing  */
 #define SPEED_COAST_MS2            2.50f
+
+/* Most reverse duty the speed loop may use as a brake. -100 is the bridge's full
+ * reverse and throws the car onto its nose; a small number here is what makes
+ * braking feel smooth, the rest of the slowing is done by lifting off. */
+#define SPEED_BRAKE_DUTY_MAX       18.0f
+
+/* ...and the faster the car is going, the harder it may brake. The decel limit
+ * and the reverse cap follow a power curve of speed:
+ *
+ *     brake = gentle + (full - gentle) * s^SPEED_BRAKE_EXP
+ *
+ * where s is the speed fraction from SPEED_BRAKE_RAMP_FROM (0 = standstill) to
+ * 100%. With the exponent at 2 the brake follows the car's kinetic energy: next
+ * to nothing extra at half speed, most of it arriving in the last quarter. */
+#define SPEED_BRAKE_RAMP_FROM      0.00f   /* fraction of full speed             */
+#define SPEED_BRAKE_EXP            2.00f   /* 1 = linear, higher = later/steeper */
+#define SPEED_DEC_FULL_MS2         7.50f   /* decel limit when at 100%           */
+#define SPEED_BRAKE_DUTY_FULL      55.0f   /* reverse duty cap when at 100%      */
 
 /* Master switch. 0 falls back to the original open-loop ramp and reverse brake
  * pulse, which is how test/compare.sh measures what this is worth. */
@@ -581,8 +632,8 @@
  * ===================================================================*/
 #define BRAKE_ENABLE               1
 #define BRAKE_TRIGGER              16.0f   /* speed-unit deficit that starts a pulse */
-#define BRAKE_REVERSE_MAX          28.0f   /* strongest reverse allowed              */
-#define BRAKE_MAX_MS               90.0f   /* never brake longer than this           */
+#define BRAKE_REVERSE_MAX          12.0f   /* strongest reverse allowed              */
+#define BRAKE_MAX_MS               60.0f   /* never brake longer than this           */
 
 /* =====================================================================
  * TORQUE VECTORING - slow the inside wheel through a corner
@@ -635,6 +686,20 @@
 #ifndef LOST_STOP_M
 #define LOST_STOP_M                0.75f
 #endif
+
+/* Intersections.
+ *
+ * At a crossing the black edges stop on both sides and the only thing left in the
+ * picture is the crossing bar, which is horizontal and gets filtered out as noise.
+ * So a frame that decoded fine but produced no usable edge vector at all is not
+ * "lost", it is an intersection, and the right move is to drive straight through
+ * it. Steering is centred, speed is held at XING_SPEED, and after XING_MAX_M of
+ * ground with still nothing to see the normal lost-track logic takes over. */
+#ifndef XING_ENABLE
+#define XING_ENABLE                1
+#endif
+#define XING_SPEED                 35.0f
+#define XING_MAX_M                 1.00f
 
 /* If the camera says nothing at all for this long, cut the motors. */
 #define CAM_TIMEOUT_MS             350.0f

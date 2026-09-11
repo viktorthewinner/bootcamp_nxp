@@ -116,6 +116,7 @@ void Driver_Init(void)
     s_st.frames     = 0u;
     s_st.elapsedMs  = 0.0f;
     s_st.exiting    = false;
+    s_st.crossing   = false;
 
     s_st.track.haveTrack = false;
     s_st.track.nValid    = 0u;
@@ -155,6 +156,17 @@ static void plan_steering(float dtFrame)
     /* Which way the road points right in front of the bumper. Without this the car
      * only reacts to being off line, and always turns in a fraction too late. */
     headN = clampf(m->headNear / STEER_HEAD_SCALE, -1.5f, 1.5f);
+
+    /* Corner exit: the road ahead is straight, the car is not yet. Lean harder on
+     * the heading so the car comes out parallel instead of drifting to the outside
+     * edge of the straight and correcting there. (Also what unlocks the exit
+     * acceleration in Driver_Step, so the two always agree on when an exit is.) */
+    s_st.exiting = (fabsf(m->headFar) < (0.30f * LINE_HEAD_REF)) &&
+                   (fabsf(m->headNear) > (0.30f * LINE_HEAD_REF));
+    if (s_st.exiting)
+    {
+        headN *= STEER_EXIT_HEAD_BOOST;
+    }
 
     /*
      * How corner-like the road is, 0 for a kink and 1 for a proper corner. The
@@ -262,6 +274,30 @@ static void plan_steering(float dtFrame)
         steer += STEER_KFF * c * cornerness_of(m);
     }
 
+    /* A little more lock once this is clearly a corner. */
+    steer *= 1.0f + ((STEER_CORNER_GAIN - 1.0f) * cornerness_of(m));
+
+    /* And a little more again when arriving at full speed. */
+    {
+        float fast = clampf((s_speedFrac - STEER_FULLSPEED_FROM) / (1.0f - STEER_FULLSPEED_FROM),
+                            0.0f, 1.0f);
+
+        steer *= 1.0f + ((STEER_FULLSPEED_GAIN - 1.0f) * fast);
+    }
+
+#if SPEED_CLOSED_LOOP
+    /* Trail braking: feed the lock in over the braking event, so the full angle
+     * is there at the last moment of braking rather than the first. */
+    {
+        const SpeedState *sc = SpeedCtl_State();
+
+        if (sc->braking)
+        {
+            steer *= STEER_BRAKE_START_FRAC + ((1.0f - STEER_BRAKE_START_FRAC) * sc->brakeProg);
+        }
+    }
+#endif
+
     /* Left and right are not mechanically identical on this car. */
     steer *= (steer >= 0.0f) ? STEER_GAIN_RIGHT : STEER_GAIN_LEFT;
 
@@ -351,9 +387,7 @@ static void plan_speed(void)
 
     s_vTarget = clampf(v, 0.0f, 100.0f);
 
-    /* Corner exit: still turning here, straight from here on. Time for full power. */
-    s_st.exiting = (fabsf(m->headFar) < (0.30f * LINE_HEAD_REF)) &&
-                   (fabsf(m->headNear) > (0.30f * LINE_HEAD_REF));
+    /* s_st.exiting (full power out of the corner) is decided in plan_steering. */
 }
 
 /* ---- main step ---------------------------------------------------------- */
@@ -397,17 +431,32 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
             float dtFrame = clampf(s_sinceFrame, 1.0e-4f, 0.2f);
 
             s_st.lostFrames = 0u;
+            s_st.crossing   = false;
             RL_Compute(&s_st.track, s_speedFrac, &s_st.line);
             plan_steering(dtFrame);
             plan_speed();
         }
-        else if (s_st.lostFrames < 0xFFFFu)
-        {
-            s_st.lostFrames++;
-        }
         else
         {
-            /* counter pinned, nothing more to do */
+            if (s_st.lostFrames < 0xFFFFu)
+            {
+                s_st.lostFrames++;
+            }
+
+            /* No edge line on either side: the camera is looking across an
+             * intersection. Point the wheels straight and keep going; the far side
+             * of the crossing will bring the edges back. Latched, so a stray
+             * vector on one frame does not flip the car back into lost mode. */
+#if XING_ENABLE
+            if (s_st.track.segCount == 0u)
+            {
+                s_st.crossing = true;
+            }
+#endif
+            if (s_st.crossing)
+            {
+                s_steerTgt = 0.0f;
+            }
         }
 
         s_sinceFrame = 0.0f;
@@ -470,11 +519,28 @@ void Driver_Step(bool freshFrame, const TrkSegment *segs, uint8_t n, float dt, D
         s_blindM = 0.0f;
     }
 
+    /* An intersection that goes on for longer than any real crossing could is not
+     * an intersection, it is the car having left the track. */
+    if (s_st.crossing && (s_blindM > XING_MAX_M))
+    {
+        s_st.crossing = false;
+    }
+
     if (running)
     {
         if (s_blindMs > CAM_TIMEOUT_MS)
         {
             v = 0.0f;
+        }
+        else if (s_st.crossing)
+        {
+            /* Straight through at a steady speed. The lost-track caps below are
+             * deliberately skipped: they would slow the car in the middle of the
+             * crossing, where the camera has the least to look at. */
+            if (v > XING_SPEED)
+            {
+                v = XING_SPEED;
+            }
         }
         else if ((s_blindM > LOST_STOP_M) ||
                  ((s_speedCmd < 6.0f) &&
